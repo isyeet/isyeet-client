@@ -1,0 +1,6 @@
+ISYEET_ENVIRONMENT = staging
+ISYEET_SERVER_URL = https:/$()/api-staging.isyeet.io
+ISYEET_GOOGLE_CLIENT_ID = 153602924551-l4hi3f0g8rcbi903958is5hlvnau8q60.apps.googleusercontent.com
+ISYEET_CALLBACK_SCHEME = com.googleusercontent.apps.153602924551-l4hi3f0g8rcbi903958is5hlvnau8q60
+ISYEET_ALLOW_LOOPBACK_HTTP = NO
+#include? "Local.xcconfig"

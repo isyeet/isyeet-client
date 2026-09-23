@@ -1,0 +1,31 @@
+{
+  "build": 11,
+  "source_status": "source-candidate",
+  "source_release_sha256": "78c3d33e069530b129f27051c5464807fe4306aa33f77c2a9afad43b8905fde9",
+  "source_lock_sha256": "62fd56e91840e8a8c09edc4bdfc3a73a6d940c81bfd1a215191932ae35948f9b",
+  "backend_revision": "f054e4e6081dddbf9f0da42cdd4fc547dfebac1e",
+  "ios_revision": "283aa4cb5f1e2dcdf06e86c96db7edd8319fc53a",
+  "dependency_count": 289,
+  "offline_locked_metadata_verified": true,
+  "files": {
+    ".cargo/config.toml": "68e6651bbff96ebb8ee069be2311e2f44f3ebafac611671867af72e9d66c86ad",
+    "DEPENDENCY_LICENSES.json": "7f0212f14ec2d0e638a63df723e0476d1e50cedf0d7c744c24a4443f3e871daf",
+    "DEPENDENCY_README.md": "1e3908d9cf4979e534e50898f6dfce35945c4905a1424b46a592009077b00ec1",
+    "upstream-licenses/SparsePostQuantumRatchet-06959b4708f9b7b1e94d0f8cc835f3958c077e94/LICENSE": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0",
+    "upstream-licenses/libsignal-ba133bd3457f556fbf56db0a5ab985de0af79da6/LICENSE": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0",
+    "upstream-licenses/registry/MPL-2.0.txt": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04",
+    "upstream-licenses/registry/celabshq-libcrux-316fcd6c19c2e33bd0429e1319b6557d91038512/LICENSE": "c517c468fc7f8d83319dd8b3743923f6891e0dfbaf7c57a874758c8f39b98564",
+    "upstream-licenses/registry/celabshq-libcrux-316fcd6c19c2e33bd0429e1319b6557d91038512/LICENSE-MIT": "e40d41f94826514279cc7648088180e19621f7acd281dd394a0534d535da51fd",
+    "upstream-licenses/registry/celabshq-libcrux-451259bb704d4a9dab8cd31ac68a97e766fbd2bc/LICENSE": "c517c468fc7f8d83319dd8b3743923f6891e0dfbaf7c57a874758c8f39b98564",
+    "upstream-licenses/registry/celabshq-libcrux-451259bb704d4a9dab8cd31ac68a97e766fbd2bc/LICENSE-MIT": "e40d41f94826514279cc7648088180e19621f7acd281dd394a0534d535da51fd",
+    "upstream-licenses/registry/celabshq-libcrux-8ebe73237378c80b86a953ec8a77bdd3299918e7/LICENSE": "c517c468fc7f8d83319dd8b3743923f6891e0dfbaf7c57a874758c8f39b98564",
+    "upstream-licenses/registry/celabshq-libcrux-8ebe73237378c80b86a953ec8a77bdd3299918e7/LICENSE-MIT": "e40d41f94826514279cc7648088180e19621f7acd281dd394a0534d535da51fd",
+    "upstream-licenses/registry/celabshq-libcrux-c5fb80f37530ee9b2df9501ae5ff8cb4a973a4bd/LICENSE": "c517c468fc7f8d83319dd8b3743923f6891e0dfbaf7c57a874758c8f39b98564",
+    "upstream-licenses/registry/celabshq-libcrux-c5fb80f37530ee9b2df9501ae5ff8cb4a973a4bd/LICENSE-MIT": "e40d41f94826514279cc7648088180e19621f7acd281dd394a0534d535da51fd",
+    "upstream-licenses/registry/cryspen-hax-d8b5b3d3b666fee8943a351445d2b680105e8ea3/LICENSE": "9a50bad5a51e0ad726ea3a7f4b7b758e1b4d1784e6abefe1367f5bf01e972725",
+    "upstream-licenses/registry/r-efi-r-efi-7e1b0322d31d625f81a5656096330934f9cd835d/AUTHORS": "d027e91dbc9cdbb2f1190068e498bd6b61cff022b6a032b191021ba658d96111",
+    "upstream-licenses/registry/r-efi-r-efi-97b55bed1c2c91dcbf787674849f05337ff80b33/AUTHORS": "ff92bed461f50338dd703a9ba9aee496a425957873df1d91192776e4bdf5dda7",
+    "upstream-licenses/registry/winapi-0.3.9/LICENSE-APACHE": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+    "upstream-licenses/registry/winapi-0.3.9/LICENSE-MIT": "ce7bc3499fee93d5022ef430d5e4201e79a6d9154f3974e42f41349f0569e09b"
+  }
+}

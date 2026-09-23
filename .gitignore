@@ -1,0 +1,12 @@
+/target/
+/vendor/
+/.cargo/
+/ios/.build/
+/ios/Frameworks/
+/ios/build/
+/ios/Config/Local.xcconfig
+*.state.json
+isyeet-state*
+client_secret*.json
+AuthKey_*.p8
+.DS_Store
