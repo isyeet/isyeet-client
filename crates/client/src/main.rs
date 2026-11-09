@@ -1,4 +1,4 @@
-//! Small local CLI: explicit Google login, immutable account state, ASCII text only.
+//! Local CLI: passkey account access, immutable account state, ASCII text only.
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -14,7 +14,6 @@ use std::{
     collections::BTreeSet,
     fs::{File, OpenOptions},
     io::{Read, Write},
-    net::TcpListener,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -33,46 +32,44 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Sign in to Gmail or Google Workspace in the browser with an OAuth Desktop client.
-    Login {
-        #[arg(
-            long,
-            env = "ISYEET_GOOGLE_CLIENT_ID",
-            required_unless_present = "client_config",
-            conflicts_with = "client_config"
-        )]
-        client_id: Option<String>,
-        #[arg(
-            long,
-            env = "ISYEET_GOOGLE_CLIENT_SECRET",
-            hide_env_values = true,
-            conflicts_with = "client_config"
-        )]
-        client_secret: Option<String>,
-        /// Google's downloaded OAuth Desktop JSON. Token endpoints remain fixed.
+    /// Experimental: ask the phone to approve this new device; messaging stays unavailable.
+    #[cfg(feature = "device-linking")]
+    DeviceRequest {
         #[arg(long)]
-        client_config: Option<PathBuf>,
+        label: String,
+        /// Full root fingerprint copied independently from the primary phone.
+        #[arg(long)]
+        root_fingerprint: String,
     },
+    /// Experimental: read the phone's public approval code from stdin.
+    #[cfg(feature = "device-linking")]
+    DeviceAccept,
+    /// Experimental: show saved approval status; this does not enable messaging.
+    #[cfg(feature = "device-linking")]
+    DeviceStatus,
+    /// Sign in with a passkey; this does not link a new messaging device.
+    Login,
     /// Local test only; requires a feature-gated development server on loopback.
     DevLogin {
-        email: String,
+        username: String,
     },
     /// Show your public identity fingerprint to compare over a trusted channel.
     Fingerprint,
-    /// Look up a Gmail or Google Workspace contact and pin its immutable public identity.
+    /// Look up an exact username and pin its immutable account ID and public identity.
     AddContact {
-        email: String,
+        username: String,
     },
     /// Confirm the full fingerprint received independently from the contact.
     VerifyContact {
-        email: String,
+        #[arg(value_name = "USERNAME_OR_ACCOUNT_ID")]
+        account_id: String,
         #[arg(long)]
         fingerprint: String,
     },
     /// Retired shortcut: remove, re-add and independently verify the contact instead.
     #[command(hide = true)]
     ReplaceContact {
-        email: String,
+        account_id: String,
         /// The currently pinned full fingerprint, shown by contacts.
         #[arg(long)]
         previous_fingerprint: String,
@@ -82,7 +79,8 @@ enum Command {
     },
     /// Remove a contact, its direct history and all affected unsent messages.
     RemoveContact {
-        email: String,
+        #[arg(value_name = "USERNAME_OR_ACCOUNT_ID")]
+        account_id: String,
         /// The current full saved fingerprint from contacts; prevents stale removal.
         #[arg(long)]
         previous_fingerprint: String,
@@ -101,7 +99,8 @@ enum Command {
     History,
     /// Send printable ASCII text. Omit --text to read exact bytes from standard input.
     Send {
-        email: String,
+        #[arg(value_name = "USERNAME_OR_ACCOUNT_ID")]
+        account_id: String,
         #[arg(long)]
         text: Option<String>,
     },
@@ -161,9 +160,9 @@ struct LocalState {
 }
 
 impl LocalState {
-    fn ensure_contact_ready(&self, email: &str) -> Result<()> {
+    fn ensure_contact_ready(&self, account_id: &str) -> Result<()> {
         ensure!(
-            !self.contact_identity_changes.contains(email),
+            !self.contact_identity_changes.contains(account_id),
             "Contact identity changed; remove-contact, then add-contact and independently verify the new fingerprint before sending or retrying."
         );
         Ok(())
@@ -181,7 +180,7 @@ impl LocalState {
             "This group's identity verification changed. Create a new group after re-verifying its members."
         );
         for member in &group.members {
-            self.ensure_contact_ready(&member.email)?;
+            self.ensure_contact_ready(&member.account_id)?;
         }
         Ok(())
     }
@@ -303,16 +302,21 @@ fn load(path: &Path) -> Result<Option<LocalState>> {
     file.read_to_end(&mut data)?;
     let state: LocalState =
         serde_json::from_slice(&data).context("Invalid state file; refusing to replace keys.")?;
+    state.core.validate_identity_schema()?;
     ensure!(
         state.contact_identity_changes.len() <= 64
-            && state.contact_identity_changes.iter().all(|email| {
-                canonical_email(email).as_ref() == Ok(email) && state.core.has_contact(email)
+            && state.contact_identity_changes.iter().all(|account_id| {
+                canonical_account_id(account_id).as_ref() == Ok(account_id)
+                    && state.core.has_contact(account_id)
             }),
         "Invalid state file; refusing to replace keys."
     );
     Ok(Some(state))
 }
 fn save(path: &Path, state: &LocalState) -> Result<()> {
+    save_serialized(path, state)
+}
+fn save_serialized<T: Serialize>(path: &Path, state: &T) -> Result<()> {
     let data = serde_json::to_vec(state)?;
     ensure!(data.len() <= MAX_STATE_BYTES, "State capacity reached.");
     let parent = path
@@ -338,6 +342,130 @@ fn save(path: &Path, state: &LocalState) -> Result<()> {
     }
     result.context("Could not durably save state; no send or acknowledgment performed.")
 }
+#[cfg(feature = "device-linking")]
+fn load_device_candidate(path: &Path) -> Result<isyeet_client::DeviceCandidate> {
+    let mut file = safe_file(path, false)?;
+    ensure!(
+        file.metadata()?.len() <= MAX_STATE_BYTES as u64,
+        "Candidate state file too large."
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let candidate: isyeet_client::DeviceCandidate = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid candidate state; refusing to replace keys."))?;
+    candidate
+        .status()
+        .map_err(|_| anyhow::anyhow!("Invalid candidate cryptographic state."))?;
+    Ok(candidate)
+}
+#[cfg(feature = "device-linking")]
+fn run_device_command(args: &Args, server: &str) -> Result<()> {
+    use isyeet_wire::linking::{DEVICE_TIME_SKEW, DeviceAuthorityResponse, MAX_DEVICE_CODE_BYTES};
+    let now = || -> Result<i64> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            .try_into()?)
+    };
+    match &args.command {
+        Command::DeviceRequest {
+            label,
+            root_fingerprint,
+        } => {
+            match std::fs::symlink_metadata(&args.state) {
+                Ok(_) => bail!(
+                    "State file already exists. Use a new private candidate path; existing device keys are never overwritten."
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            let client = client()?;
+            let login = passkey_login(&client, server)?;
+            let response: DeviceAuthorityResponse = json_response(
+                client
+                    .get(format!("{server}/v3/devices/authority"))
+                    .bearer_auth(&login.token)
+                    .send()
+                    .context("Experimental device authorization is unavailable on this service.")?,
+            )?;
+            ensure!(
+                !response.messaging_available
+                    && response.server_time.abs_diff(now()?) <= DEVICE_TIME_SKEW as u64,
+                "Invalid device-authority response."
+            );
+            let roster=response.authority.context("Open the experimental Devices view on your primary phone and initialize its authority first.")?;
+            ensure!(
+                roster.roster.account_id == login.account_id && roster.roster.origin == server,
+                "Device authority belongs to another account or service."
+            );
+            let candidate=isyeet_client::DeviceCandidate::create(roster,label,root_fingerprint,now()?).map_err(|_|anyhow::anyhow!("Device request rejected. Check the phone fingerprint, roster expiry and available device slot."))?;
+            let code = candidate
+                .code()
+                .map_err(|_| anyhow::anyhow!("Device request rejected."))?;
+            save_serialized(&args.state, &candidate)?;
+            println!("Account: @{} ({})", login.username, login.account_id);
+            println!("Compare these public values with the phone before approving:");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &candidate
+                        .status()
+                        .map_err(|_| anyhow::anyhow!("Device request rejected."))?
+                )?
+            );
+            println!(
+                "Paste this public request code into Devices on your primary phone within five minutes:"
+            );
+            println!("{code}");
+            println!(
+                "This is an experimental authorization request. It does not enable desktop messaging."
+            );
+        }
+        Command::DeviceAccept => {
+            let mut candidate = load_device_candidate(&args.state)?;
+            ensure!(
+                candidate.request.request.origin == server,
+                "This candidate is pinned to another service URL."
+            );
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take((MAX_DEVICE_CODE_BYTES + 2) as u64)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() <= MAX_DEVICE_CODE_BYTES + 1,
+                "Approval code too large."
+            );
+            if bytes.last() == Some(&b'\n') {
+                bytes.pop();
+            }
+            let code = std::str::from_utf8(&bytes).context("Approval code must be ASCII.")?;
+            let status=candidate.accept(code,now()?).map_err(|_|anyhow::anyhow!("Approval rejected: wrong device, invalid signature, changed authority, or expired request."))?;
+            save_serialized(&args.state, &candidate)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            println!("Approval recorded. Messaging is unavailable in this build.");
+        }
+        Command::DeviceStatus => {
+            let candidate = load_device_candidate(&args.state)?;
+            ensure!(
+                candidate.request.request.origin == server,
+                "This candidate is pinned to another service URL."
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &candidate
+                        .status()
+                        .map_err(|_| anyhow::anyhow!("Candidate status rejected."))?
+                )?
+            );
+            println!(
+                "Saved authorization only; live revocation status is not checked. Messaging is unavailable in this build."
+            );
+        }
+        _ => bail!("Unknown device command."),
+    }
+    Ok(())
+}
 fn persist(path: &Path, current: &mut LocalState, mut proposed: LocalState) -> Result<()> {
     proposed.core.expire()?;
     save(path, &proposed)?;
@@ -354,311 +482,178 @@ fn expire_state(path: &Path, state: &mut LocalState) -> Result<()> {
 fn remove_local_contact(
     path: &Path,
     state: &mut LocalState,
-    email: &str,
+    account_id: &str,
     previous_fingerprint: &str,
 ) -> Result<()> {
     let mut proposed = state.clone();
-    if proposed.contact_identity_changes.contains(email) {
-        proposed.core.block_groups_for_contact(email)?;
+    if proposed.contact_identity_changes.contains(account_id) {
+        proposed.core.block_groups_for_contact(account_id)?;
     }
-    proposed.core.remove_contact(email, previous_fingerprint)?;
-    proposed.contact_identity_changes.remove(email);
+    proposed
+        .core
+        .remove_contact(account_id, previous_fingerprint)?;
+    proposed.contact_identity_changes.remove(account_id);
     persist(path, state, proposed)
 }
 fn reconcile_group_identity_warnings(path: &Path, state: &mut LocalState) -> Result<()> {
     if !state.contact_identity_changes.is_empty() {
         let mut proposed = state.clone();
-        for email in &proposed.contact_identity_changes {
-            proposed.core.block_groups_for_contact(email)?;
+        for account_id in &proposed.contact_identity_changes {
+            proposed.core.block_groups_for_contact(account_id)?;
         }
         persist(path, state, proposed)?;
     }
     Ok(())
 }
-fn block_changed_contact(path: &Path, state: &mut LocalState, email: &str) -> Result<()> {
+fn block_changed_contact(path: &Path, state: &mut LocalState, account_id: &str) -> Result<()> {
     ensure!(
-        state.core.has_contact(email),
+        state.core.has_contact(account_id),
         "Unknown contact identity change."
     );
-    if !state.contact_identity_changes.contains(email) {
+    if !state.contact_identity_changes.contains(account_id) {
         ensure!(
             state.contact_identity_changes.len() < 64,
             "Contact capacity reached."
         );
         let mut proposed = state.clone();
-        proposed.contact_identity_changes.insert(email.to_owned());
-        proposed.core.block_groups_for_contact(email)?;
+        proposed
+            .contact_identity_changes
+            .insert(account_id.to_owned());
+        proposed.core.block_groups_for_contact(account_id)?;
         persist(path, state, proposed)?;
     }
     Ok(())
 }
-fn random_token() -> String {
-    let mut bytes = [0; 32];
-    rand::rngs::OsRng.unwrap_err().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-fn desktop_config(path: &Path) -> Result<(String, Option<String>)> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .context("Cannot read OAuth client configuration.")?;
-    ensure!(
-        file.metadata()?.is_file(),
-        "OAuth client configuration must be a regular file."
-    );
-    let mut bytes = Vec::new();
-    file.take(65537).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= 65536,
-        "OAuth client configuration too large."
-    );
-    let data: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| anyhow::anyhow!("Invalid OAuth client configuration JSON."))?;
-    let installed = data.get("installed").ok_or_else(|| {
-        anyhow::anyhow!(
-            "Download a Google Desktop OAuth client configuration, not a Web or iOS client."
-        )
-    })?;
-    let id = installed
-        .get("client_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("Desktop configuration has no client ID."))?;
-    let secret = installed.get("client_secret").and_then(Value::as_str);
-    ensure!(
-        secret.is_none_or(|s| s.len() <= 4096 && s.is_ascii()),
-        "Invalid client configuration."
-    );
-    Ok((id.to_owned(), secret.map(str::to_owned)))
-}
-struct GoogleIdentity {
-    token: String,
-    email: String,
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserLoginStart {
+    request_id: String,
+    browser_url: String,
+    verification_code: String,
+    expires_at: i64,
 }
 
-fn google_identity_email(token: &str, client_id: &str, nonce: &str, now: i64) -> Result<String> {
-    const INVALID: &str = "Google identity response rejected.";
-    #[derive(Deserialize)]
-    struct Header {
-        alg: String,
-    }
-    #[derive(Deserialize)]
-    struct Claims {
-        nonce: String,
-        iss: String,
-        aud: String,
-        exp: i64,
-        email: String,
-        email_verified: bool,
-        #[serde(default)]
-        hd: Option<String>,
-    }
-    ensure!(token.len() <= 16384 && token.is_ascii(), INVALID);
-    let parts: Vec<_> = token.split('.').collect();
+fn validate_browser_start(server: &str, start: &BrowserLoginStart, now: i64) -> Result<Url> {
+    const REJECTED: &str = "Invalid browser sign-in request.";
     ensure!(
-        parts.len() == 3 && parts.iter().all(|part| !part.is_empty()),
-        INVALID
+        canonical_account_id(&start.request_id).as_ref() == Ok(&start.request_id),
+        REJECTED
     );
-    let header = URL_SAFE_NO_PAD
-        .decode(parts[0])
-        .map_err(|_| anyhow::anyhow!(INVALID))?;
-    let header: Header = serde_json::from_slice(&header).map_err(|_| anyhow::anyhow!(INVALID))?;
-    ensure!(header.alg == "RS256", INVALID);
-    let payload = URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .map_err(|_| anyhow::anyhow!(INVALID))?;
-    let claims: Claims = serde_json::from_slice(&payload).map_err(|_| anyhow::anyhow!(INVALID))?;
-    let nonce_matches = claims.nonce.len() == nonce.len()
-        && claims
-            .nonce
-            .bytes()
-            .zip(nonce.bytes())
-            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-            == 0;
     ensure!(
-        nonce_matches
-            && matches!(
-                claims.iss.as_str(),
-                "accounts.google.com" | "https://accounts.google.com"
-            )
-            && claims.aud == client_id
-            && claims.exp > now,
-        INVALID
+        start.expires_at > now && start.expires_at <= now.saturating_add(300),
+        REJECTED
     );
-    google_account_email(&claims.email, claims.email_verified, claims.hd.as_deref())
-        .map_err(|_| anyhow::anyhow!(INVALID))
+    ensure!(
+        start.verification_code.len() == 8
+            && start
+                .verification_code
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()),
+        REJECTED
+    );
+    let expected = Url::parse(server)?;
+    let browser = Url::parse(&start.browser_url).map_err(|_| anyhow::anyhow!(REJECTED))?;
+    let query: Vec<_> = browser.query_pairs().collect();
+    ensure!(
+        browser.origin() == expected.origin()
+            && browser.username().is_empty()
+            && browser.password().is_none()
+            && browser.path() == "/auth"
+            && browser.fragment().is_none()
+            && query.len() == 1
+            && query[0].0 == "request"
+            && query[0].1 == start.request_id,
+        REJECTED
+    );
+    Ok(browser)
 }
 
-fn bind_login_email(login: &LoginResponse, expected: &str) -> Result<()> {
-    ensure!(
-        login.email == expected,
-        "Service account does not match the authenticated Google identity; no local account changes were saved."
-    );
-    Ok(())
-}
-
-fn google_login(
-    client: &Client,
-    client_id: &str,
-    client_secret: Option<&str>,
-) -> Result<GoogleIdentity> {
-    ensure!(
-        client_id.ends_with(".apps.googleusercontent.com")
-            && client_id.is_ascii()
-            && client_id.len() < 256,
-        "A Google OAuth Desktop client ID is required."
-    );
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    listener.set_nonblocking(true)?;
-    let redirect = format!(
-        "http://127.0.0.1:{}/callback",
-        listener.local_addr()?.port()
-    );
-    let verifier = random_token();
+fn passkey_login(client: &Client, server: &str) -> Result<LoginResponse> {
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.unwrap_err().fill_bytes(&mut secret);
+    let verifier = URL_SAFE_NO_PAD.encode(secret);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    let state = random_token();
-    let nonce = random_token();
-    let mut auth = Url::parse("https://accounts.google.com/o/oauth2/v2/auth")?;
-    auth.query_pairs_mut().extend_pairs([
-        ("client_id", client_id),
-        ("redirect_uri", &redirect),
-        ("response_type", "code"),
-        ("scope", "openid email"),
-        ("state", &state),
-        ("nonce", &nonce),
-        ("code_challenge", &challenge),
-        ("code_challenge_method", "S256"),
-        ("prompt", "select_account"),
-    ]);
-    eprintln!("Complete Google sign-in in your browser. If it did not open, visit:\n{auth}");
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open")
-        .arg(auth.as_str())
-        .spawn();
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open")
-        .arg(auth.as_str())
-        .spawn();
-    let start = Instant::now();
-    let code = loop {
-        ensure!(
-            start.elapsed() < Duration::from_secs(180),
-            "Google sign-in timed out."
-        );
-        let (mut connection, _) = match listener.accept() {
-            Ok(value) => value,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(25));
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        connection.set_read_timeout(Some(Duration::from_secs(3)))?;
-        let mut request = Vec::new();
-        loop {
-            let mut buffer = [0; 1024];
-            let count = connection.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..count]);
-            if request.windows(4).any(|w| w == b"\r\n\r\n") || request.len() >= 8192 {
-                break;
-            }
-        }
-        let parsed = (|| -> Result<String> {
-            ensure!(request.len() < 8192, "Invalid OAuth callback.");
-            let line = std::str::from_utf8(&request)?.lines().next().unwrap_or("");
-            let mut parts = line.split_ascii_whitespace();
-            ensure!(parts.next() == Some("GET"), "Invalid callback method.");
-            let target = parts
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("Invalid callback."))?;
-            ensure!(target.starts_with("/callback?"), "Invalid callback path.");
-            let url = Url::parse(&format!("http://127.0.0.1{target}"))?;
-            let pairs: Vec<_> = url.query_pairs().collect();
-            let values: Vec<_> = pairs
-                .iter()
-                .filter(|(k, _)| k == "state")
-                .map(|(_, v)| v.as_ref())
-                .collect();
-            ensure!(
-                values.len() == 1 && values[0] == state,
-                "OAuth state mismatch."
-            );
-            let codes: Vec<_> = pairs
-                .iter()
-                .filter(|(k, _)| k == "code")
-                .map(|(_, v)| v.as_ref())
-                .collect();
-            ensure!(
-                codes.len() == 1 && codes[0].len() <= 4096,
-                "Google sign-in declined or invalid callback."
-            );
-            Ok(codes[0].to_owned())
-        })();
-        let (status, body) = if parsed.is_ok() {
-            ("200 OK", "Sign-in received. Return to the ISYEET terminal.")
-        } else {
-            ("400 Bad Request", "Invalid sign-in callback.")
-        };
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=us-ascii\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = connection.write_all(response.as_bytes());
-        if let Ok(code) = parsed {
-            break code;
-        }
-    };
-    let mut form = vec![
-        ("client_id", client_id),
-        ("code", &code),
-        ("code_verifier", &verifier),
-        ("redirect_uri", &redirect),
-        ("grant_type", "authorization_code"),
-    ];
-    if let Some(secret) = client_secret {
-        form.push(("client_secret", secret));
-    }
-    let tokens: Value = json_response(
+    let requested = Instant::now();
+    let start: BrowserLoginStart = json_response(
         client
-            .post("https://oauth2.googleapis.com/token")
-            .form(&form)
+            .post(format!("{server}/v2/auth/cli/start"))
+            .json(&serde_json::json!({"code_challenge": challenge}))
             .send()
-            .context("Google token exchange failed.")?,
+            .context("Cannot start passkey sign-in.")?,
     )?;
-    let token = tokens
-        .get("id_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("Google did not return an identity token."))?;
-    // This exact token came from Google's fixed HTTPS endpoint with redirects
-    // disabled. Bind its typed public claims to the browser transaction and local
-    // account. The backend still verifies the JWT signature before authorizing.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
-    let email = google_identity_email(token, client_id, &nonce, now)?;
-    Ok(GoogleIdentity {
-        token: token.to_owned(),
-        email,
-    })
+    let browser = validate_browser_start(server, &start, now)?;
+    let lifetime = Duration::from_secs((start.expires_at - now) as u64);
+    eprintln!(
+        "Open this page and approve only if it shows code {}:\n{}",
+        start.verification_code, browser
+    );
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open")
+        .arg(browser.as_str())
+        .spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open")
+        .arg(browser.as_str())
+        .spawn();
+    let mut delay = Duration::from_secs(5);
+    loop {
+        ensure!(
+            requested.elapsed().saturating_add(delay) < lifetime,
+            "Passkey sign-in expired; start login again."
+        );
+        std::thread::sleep(delay);
+        let response = client
+            .post(format!("{server}/v2/auth/cli/redeem"))
+            .json(&serde_json::json!({"request_id": start.request_id, "code_verifier": verifier}))
+            .send()
+            .context("Sign-in delivery failed; start login again. No token was saved.")?;
+        match response.status().as_u16() {
+            200 => return json_response(response),
+            202 => {
+                let pending: Value = json_response(response)?;
+                ensure!(
+                    pending == serde_json::json!({"status":"pending"}),
+                    "Invalid sign-in status."
+                );
+                delay = Duration::from_secs(5);
+            }
+            429 => {
+                let retry = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(10);
+                delay = Duration::from_secs(retry.clamp(5, 60));
+            }
+            410 => bail!("Passkey sign-in expired or was rejected; start login again."),
+            _ => bail!(
+                "Passkey sign-in failed (HTTP {}).",
+                response.status().as_u16()
+            ),
+        }
+    }
 }
+
 fn bind_existing_login(
     client: &Client,
     state: &mut LocalState,
     login: LoginResponse,
 ) -> Result<()> {
     ensure!(
-        state.core.email == login.email,
-        "This state belongs to a different Google account; refusing to replace its identity."
+        state.core.account_id == login.account_id && state.core.username == login.username,
+        "This state belongs to a different account; refusing to replace its identity."
     );
     // Do not save the fresh bearer until the current registration has been
     // checked. Otherwise a failed login could let a later retry republish a
     // retired initial identity into a deleted/recreated account generation.
     let keys: KeyUpload = json_response(
         client
-            .get(format!("{}/v1/keys/me", state.server))
+            .get(format!("{}/v2/keys/me", state.server))
             .bearer_auth(&login.token)
             .send()
             .context("Could not verify this device's existing registration.")?,
@@ -685,7 +680,7 @@ fn maintain_keys(client: &Client, path: &Path, state: &mut LocalState, force: bo
         // Migrated state can never automatically republish a deleted identity.
         success(
             client
-                .put(format!("{}/v1/keys", state.server))
+                .put(format!("{}/v2/keys", state.server))
                 .bearer_auth(&state.token)
                 .json(&state.core.key_upload())
                 .send()
@@ -705,7 +700,7 @@ fn maintain_keys(client: &Client, path: &Path, state: &mut LocalState, force: bo
     } else {
         let inventory: KeyMaintenanceState = json_response(
             client
-                .get(format!("{}/v1/keys/maintenance", state.server))
+                .get(format!("{}/v2/keys/maintenance", state.server))
                 .bearer_auth(&state.token)
                 .send()
                 .context("Could not check this device's key registration.")?,
@@ -720,7 +715,7 @@ fn maintain_keys(client: &Client, path: &Path, state: &mut LocalState, force: bo
     if let Some(request) = request {
         let receipt: KeyMaintenanceResponse = json_response(
             client
-                .put(format!("{}/v1/keys/maintenance", state.server))
+                .put(format!("{}/v2/keys/maintenance", state.server))
                 .bearer_auth(&state.token)
                 .json(&request)
                 .send()
@@ -736,9 +731,9 @@ fn maintain_keys(client: &Client, path: &Path, state: &mut LocalState, force: bo
 fn sync_contacts(client: &Client, state: &LocalState) -> Result<()> {
     success(
         client
-            .put(format!("{}/v1/contacts", state.server))
+            .put(format!("{}/v2/contacts", state.server))
             .bearer_auth(&state.token)
-            .json(&serde_json::json!({"emails": state.core.verified_contacts()}))
+            .json(&serde_json::json!({"account_ids": state.core.verified_contacts()}))
             .send()
             .context("Could not publish verified contacts; retry to synchronize.")?,
     )?;
@@ -757,7 +752,7 @@ fn padded_message_body(message: &SendRequest) -> Result<Vec<u8>> {
 }
 fn deliver(client: &Client, state: &LocalState, message: &SendRequest) -> Result<u16> {
     Ok(client
-        .post(format!("{}/v1/messages", state.server))
+        .post(format!("{}/v2/messages", state.server))
         .bearer_auth(&state.token)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(padded_message_body(message)?)
@@ -768,7 +763,7 @@ fn deliver(client: &Client, state: &LocalState, message: &SendRequest) -> Result
 fn traffic_policy(client: &Client, state: &LocalState) -> Result<TrafficPolicy> {
     json_response(
         client
-            .get(format!("{}/v1/traffic-mode", state.server))
+            .get(format!("{}/v2/traffic-mode", state.server))
             .bearer_auth(&state.token)
             .send()?,
     )
@@ -776,7 +771,7 @@ fn traffic_policy(client: &Client, state: &LocalState) -> Result<TrafficPolicy> 
 fn put_traffic_policy(client: &Client, state: &LocalState, cover: bool) -> Result<TrafficPolicy> {
     let policy: TrafficPolicy = json_response(
         client
-            .put(format!("{}/v1/traffic-mode", state.server))
+            .put(format!("{}/v2/traffic-mode", state.server))
             .bearer_auth(&state.token)
             .json(&serde_json::json!({"cover": cover}))
             .send()?,
@@ -909,14 +904,14 @@ fn receive(client: &Client, path: &Path, state: &mut LocalState) -> Result<()> {
     sync_contacts(client, state)?;
     let inbox: InboxResponse = json_response(
         client
-            .get(format!("{}/v1/messages?limit=50", state.server))
+            .get(format!("{}/v2/messages?limit=50", state.server))
             .bearer_auth(&state.token)
             .send()?,
     )?;
     ensure!(inbox.messages.len() <= 50, "Inbox exceeds limit.");
     for message in inbox.messages {
         let id = message.id.clone();
-        let sender = canonical_email(&message.sender).map_err(anyhow::Error::msg)?;
+        let sender = canonical_account_id(&message.sender).map_err(anyhow::Error::msg)?;
         if state.contact_identity_changes.contains(&sender) {
             eprintln!(
                 "Message pending from {sender}: remove-contact, then add-contact and independently verify its new fingerprint."
@@ -960,7 +955,7 @@ fn receive(client: &Client, path: &Path, state: &mut LocalState) -> Result<()> {
         }
         success(
             client
-                .post(format!("{}/v1/messages/ack", state.server))
+                .post(format!("{}/v2/messages/ack", state.server))
                 .bearer_auth(&state.token)
                 .json(&AckRequest { ids: vec![id] })
                 .send()
@@ -1004,7 +999,7 @@ fn send_slot(
             .core
             .cover_candidates()
             .into_iter()
-            .filter(|email| state.ensure_contact_ready(email).is_ok())
+            .filter(|account_id| state.ensure_contact_ready(account_id).is_ok())
             .collect();
         if peers.is_empty() {
             return Ok(());
@@ -1159,6 +1154,13 @@ fn run() -> Result<()> {
         return traffic_loop(&client()?, &args.state, &server, *slots);
     }
     let _lock = lock_state(&args.state)?;
+    #[cfg(feature = "device-linking")]
+    if matches!(
+        &args.command,
+        Command::DeviceRequest { .. } | Command::DeviceAccept | Command::DeviceStatus
+    ) {
+        return run_device_command(&args, &server);
+    }
     let mut existing = load(&args.state)?;
     if let Some(state) = &existing {
         ensure!(
@@ -1173,43 +1175,17 @@ fn run() -> Result<()> {
     }
     let client = client()?;
     let login = match &args.command {
-        Command::Login {
-            client_id,
-            client_secret,
-            client_config,
-        } => {
-            let (client_id, client_secret) = match client_config {
-                Some(path) => desktop_config(path)?,
-                None => (
-                    client_id
-                        .clone()
-                        .context("Google OAuth Desktop client ID required.")?,
-                    client_secret.clone(),
-                ),
-            };
-            let identity = google_login(&client, &client_id, client_secret.as_deref())?;
-            let login = json_response::<LoginResponse>(
-                client
-                    .post(format!("{server}/v1/auth/google"))
-                    .json(&GoogleLogin {
-                        id_token: identity.token,
-                    })
-                    .send()
-                    .context("Service sign-in failed.")?,
-            )?;
-            bind_login_email(&login, &identity.email)?;
-            Some(login)
-        }
-        Command::DevLogin { email } => {
+        Command::Login => Some(passkey_login(&client, &server)?),
+        Command::DevLogin { username } => {
             ensure!(
                 loopback(&Url::parse(&server)?),
                 "Development login is restricted to literal loopback."
             );
-            let email = canonical_email(email).map_err(anyhow::Error::msg)?;
+            let username = canonical_username(username).map_err(anyhow::Error::msg)?;
             Some(json_response::<LoginResponse>(
                 client
-                    .post(format!("{server}/v1/auth/dev"))
-                    .json(&ContactRequest { email })
+                    .post(format!("{server}/v2/auth/dev"))
+                    .json(&serde_json::json!({"username": username}))
                     .send()
                     .context("Development sign-in failed.")?,
             )?)
@@ -1218,11 +1194,24 @@ fn run() -> Result<()> {
     };
     if let Some(login) = login {
         ensure!(
-            canonical_email(&login.email).map_err(anyhow::Error::msg)? == login.email
+            canonical_account_id(&login.account_id).map_err(anyhow::Error::msg)?
+                == login.account_id
+                && canonical_username(&login.username).as_ref() == Ok(&login.username)
+                && !login.token.is_empty()
                 && login.token.is_ascii()
                 && login.token.len() <= 4096,
             "Invalid service login response."
         );
+        if existing.is_none() && !matches!(&args.command, Command::DevLogin { .. }) {
+            println!(
+                "Passkey sign-in succeeded for @{} ({}).",
+                login.username, login.account_id
+            );
+            println!(
+                "Create and use the messaging account on your phone. Desktop messaging requires explicit device linking, which is not available in this build. No message keys or account session were saved; passkeys can be managed in the browser."
+            );
+            return Ok(());
+        }
         let mut state = if let Some(mut state) = existing {
             bind_existing_login(&client, &mut state, login)?;
             state
@@ -1231,7 +1220,10 @@ fn run() -> Result<()> {
                 server,
                 token: login.token,
                 expires_at: login.expires_at,
-                core: futures::executor::block_on(State::initialize(&login.email))?,
+                core: futures::executor::block_on(State::initialize(
+                    &login.account_id,
+                    &login.username,
+                ))?,
                 contact_identity_changes: Default::default(),
             }
         };
@@ -1239,7 +1231,10 @@ fn run() -> Result<()> {
         save(&args.state, &state)?;
         maintain_keys(&client, &args.state, &mut state, true)?;
         sync_contacts(&client, &state)?;
-        println!("Signed in as {}", state.core.email);
+        println!(
+            "Signed in as @{} ({})",
+            state.core.username, state.core.account_id
+        );
         println!(
             "Your fingerprint: {}",
             state.core.snapshot()?["fingerprint"].as_str().unwrap_or("")
@@ -1252,7 +1247,7 @@ fn run() -> Result<()> {
     expire_state(&args.state, &mut state)?;
     let command = match args.command {
         Command::SendSelf { text } => Command::Send {
-            email: state.core.email.clone(),
+            account_id: state.core.account_id.clone(),
             text,
         },
         command => command,
@@ -1261,7 +1256,7 @@ fn run() -> Result<()> {
         Command::History => println!("{}", serde_json::to_string_pretty(&state.core.history()?)?),
         Command::Fingerprint => println!(
             "{} {}",
-            state.core.email,
+            state.core.account_id,
             state.core.snapshot()?["fingerprint"].as_str().unwrap_or("")
         ),
         Command::Contacts => println!(
@@ -1302,29 +1297,55 @@ fn run() -> Result<()> {
         Command::CreateGroup { title, members } => {
             let members = members
                 .iter()
-                .map(|email| canonical_email(email).map_err(anyhow::Error::msg))
+                .map(|account_id| state.core.contact_id(account_id))
                 .collect::<Result<Vec<_>>>()?;
-            for email in &members {
-                state.ensure_contact_ready(email)?;
+            for account_id in &members {
+                state.ensure_contact_ready(account_id)?;
             }
             let mut proposed = state.clone();
             let group = proposed.core.create_group(&title, &members)?;
             persist(&args.state, &mut state, proposed)?;
             println!("{}", serde_json::to_string_pretty(&group)?);
         }
-        Command::AddContact { email } => {
-            let email = canonical_email(&email).map_err(anyhow::Error::msg)?;
+        Command::AddContact { username } => {
+            let username = canonical_username(username.strip_prefix('@').unwrap_or(&username))
+                .map_err(anyhow::Error::msg)?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct DirectoryEntry {
+                account_id: String,
+                username: String,
+            }
+            let directory: DirectoryEntry = json_response(
+                client
+                    .post(format!("{}/v2/directory/lookup", state.server))
+                    .bearer_auth(&state.token)
+                    .json(&serde_json::json!({"username": username}))
+                    .send()?,
+            )?;
+            ensure!(
+                directory.username == username,
+                "Contact lookup returned a different username."
+            );
+            let account_id =
+                canonical_account_id(&directory.account_id).map_err(anyhow::Error::msg)?;
+            if let Ok(pinned) = state.core.contact_id(&username) {
+                ensure!(
+                    pinned == account_id,
+                    "Contact username now points to a different account; existing contact remains unchanged."
+                );
+            }
             let bundle: KeyBundle = json_response(
                 client
-                    .post(format!("{}/v1/keys/claim", state.server))
+                    .post(format!("{}/v2/keys/claim", state.server))
                     .bearer_auth(&state.token)
                     .json(&ContactRequest {
-                        email: email.clone(),
+                        account_id: account_id.clone(),
                     })
                     .send()?,
             )?;
             ensure!(
-                bundle.email == email,
+                bundle.account_id == account_id && bundle.username == username,
                 "Contact lookup returned a different identity."
             );
             let mut proposed = state.clone();
@@ -1335,12 +1356,16 @@ fn run() -> Result<()> {
                 "Compare with the contact over an independent trusted channel, then run verify-contact."
             );
         }
-        Command::VerifyContact { email, fingerprint } => {
+        Command::VerifyContact {
+            account_id,
+            fingerprint,
+        } => {
+            let account_id = state.core.contact_id(&account_id)?;
             let mut proposed = state.clone();
-            let contact = proposed.core.verify_contact(&email, &fingerprint)?;
+            let contact = proposed.core.verify_contact(&account_id, &fingerprint)?;
             persist(&args.state, &mut state, proposed)?;
             sync_contacts(&client, &state)?;
-            println!("Verified {}", contact["email"].as_str().unwrap_or(""));
+            println!("Verified {}", contact["account_id"].as_str().unwrap_or(""));
         }
         Command::ReplaceContact { .. } => {
             bail!(
@@ -1348,22 +1373,22 @@ fn run() -> Result<()> {
             );
         }
         Command::RemoveContact {
-            email,
+            account_id,
             previous_fingerprint,
         } => {
-            let email = canonical_email(&email).map_err(anyhow::Error::msg)?;
-            remove_local_contact(&args.state, &mut state, &email, &previous_fingerprint)?;
+            let account_id = state.core.contact_id(&account_id)?;
+            remove_local_contact(&args.state, &mut state, &account_id, &previous_fingerprint)?;
             println!(
-                "Removed {email} locally; its direct history and affected unsent messages were discarded. Re-add and independently verify before messaging again."
+                "Removed {account_id} locally; its direct history and affected unsent messages were discarded. Re-add and independently verify before messaging again."
             );
             sync_contacts(&client, &state).context("Removal is already saved. Relay-permission synchronization is pending; run retry or receive when connected, not remove-contact again.")?;
         }
-        Command::Send { email, text } => {
-            let email = canonical_email(&email).map_err(anyhow::Error::msg)?;
-            state.ensure_contact_ready(&email)?;
+        Command::Send { account_id, text } => {
+            let account_id = state.core.contact_id(&account_id)?;
+            state.ensure_contact_ready(&account_id)?;
             let text = message_text(text)?;
             let mut proposed = state.clone();
-            futures::executor::block_on(proposed.core.encrypt(&email, &text))?;
+            futures::executor::block_on(proposed.core.encrypt(&account_id, &text))?;
             persist(&args.state, &mut state, proposed)?;
             flush(&client, &args.state, &mut state)?;
         }
@@ -1379,11 +1404,15 @@ fn run() -> Result<()> {
         }
         Command::Retry => flush(&client, &args.state, &mut state)?,
         Command::Receive => receive(&client, &args.state, &mut state)?,
-        Command::Login { .. }
+        Command::Login
         | Command::DevLogin { .. }
         | Command::SendSelf { .. }
         | Command::Traffic { .. } => {
             unreachable!("handled above")
+        }
+        #[cfg(feature = "device-linking")]
+        Command::DeviceRequest { .. } | Command::DeviceAccept | Command::DeviceStatus => {
+            bail!("Invalid command path.")
         }
     }
     Ok(())
@@ -1400,19 +1429,140 @@ mod tests {
     use super::*;
 
     #[test]
+    fn experimental_device_commands_require_the_explicit_build_feature() {
+        for command in [
+            vec!["isyeet", "device-status"],
+            vec!["isyeet", "device-accept"],
+            vec![
+                "isyeet",
+                "device-request",
+                "--label",
+                "Desktop",
+                "--root-fingerprint",
+                "independently-compared-fingerprint",
+            ],
+        ] {
+            assert_eq!(
+                Args::try_parse_from(command).is_ok(),
+                cfg!(feature = "device-linking")
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "device-linking")]
+    fn candidate_file_is_private_separate_and_revalidated_before_use() {
+        use isyeet_wire::linking::{DeviceAuthorityReceipt, SignedDeviceChange};
+        let dir = directory();
+        let path = dir.join("candidate");
+        let candidate = futures::executor::block_on(async {
+            let mut core = State::initialize("87924606-b413-4a8a-8eee-ae8868531fbb", "alice")
+                .await
+                .unwrap();
+            let now = test_deadline() - MESSAGE_LIFETIME_SECONDS;
+            let origin = "https://api.isyeet.io";
+            core.device_authority_observe(origin, None, now).unwrap();
+            let data = core.device_authority_prepare(origin, now).await.unwrap();
+            let proposal: SignedDeviceChange =
+                serde_json::from_value(data["change"].clone()).unwrap();
+            core.device_authority_commit(DeviceAuthorityReceipt {
+                operation_id: proposal.change.operation_id.clone(),
+                roster_version: proposal.change.roster.roster.version,
+                roster_hash: proposal.change.roster.roster.digest().unwrap(),
+                messaging_available: false,
+            })
+            .unwrap();
+            let fingerprint = core.snapshot().unwrap()["fingerprint"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            isyeet_client::DeviceCandidate::create(
+                proposal.change.roster,
+                "Desktop",
+                &fingerprint,
+                now,
+            )
+            .unwrap()
+        });
+        save_serialized(&path, &candidate).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            load_device_candidate(&path).unwrap().status().unwrap(),
+            candidate.status().unwrap()
+        );
+        assert!(load(&path).is_err());
+        let mut corrupted = serde_json::to_value(&candidate).unwrap();
+        corrupted["identity_pair"] = Value::String("invalid private material".into());
+        save_serialized(&path, &corrupted).unwrap();
+        assert!(load_device_candidate(&path).is_err());
+        save_serialized(&path, &candidate).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_device_candidate(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn browser_signin_rejects_cross_origin_credentials_fragments_and_unbound_requests() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let good = format!("https://api.isyeet.io/auth?request={id}");
+        let mut start = BrowserLoginStart {
+            request_id: id.into(),
+            browser_url: good.clone(),
+            verification_code: "ABCD1234".into(),
+            expires_at: 1300,
+        };
+        assert!(validate_browser_start("https://api.isyeet.io", &start, 1000).is_ok());
+        for url in [
+            format!("https://attacker.example/auth?request={id}"),
+            format!("http://api.isyeet.io/auth?request={id}"),
+            format!("https://api.isyeet.io:444/auth?request={id}"),
+            format!("https://user@api.isyeet.io/auth?request={id}"),
+            format!("https://api.isyeet.io/auth?request={id}#token=secret"),
+            format!("https://api.isyeet.io/auth?request={id}&token=secret"),
+            format!("https://api.isyeet.io/auth?request={id}&request={id}"),
+            "https://api.isyeet.io/auth?request=00000000-0000-4000-8000-000000000002".into(),
+            format!("https://api.isyeet.io/other?request={id}"),
+        ] {
+            start.browser_url = url;
+            assert!(validate_browser_start("https://api.isyeet.io", &start, 1000).is_err());
+        }
+        start.browser_url = good;
+        for expiry in [0, 999, 1000, 1301, i64::MAX] {
+            start.expires_at = expiry;
+            assert!(validate_browser_start("https://api.isyeet.io", &start, 1000).is_err());
+        }
+        start.expires_at = 1300;
+        for code in [
+            "abcd1234",
+            "ABCD123",
+            "ABCD12345",
+            "ABCD12\n4",
+            "ABCD12\u{202e}4",
+        ] {
+            start.verification_code = code.into();
+            assert!(validate_browser_start("https://api.isyeet.io", &start, 1000).is_err());
+        }
+    }
+
+    #[test]
     fn removal_persists_before_permission_sync_and_failed_save_preserves_old_state() {
         let dir = directory();
         let path = dir.join("state");
         let (core, pin) = futures::executor::block_on(async {
-            let mut core = State::initialize("test@gmail.com").await.unwrap();
-            let peer = State::initialize("peer@gmail.com").await.unwrap();
+            let mut core = State::initialize("87924606-b413-4a8a-8eee-ae8868531fbb", "u87924606")
+                .await
+                .unwrap();
+            let peer = State::initialize("df8854a1-7e70-4247-9737-584cfec3e553", "udf8854a1")
+                .await
+                .unwrap();
             let upload = peer.key_upload();
             let pin = peer.snapshot().unwrap()["fingerprint"]
                 .as_str()
                 .unwrap()
                 .to_owned();
             core.add_contact(KeyBundle {
-                email: peer.email,
+                account_id: peer.account_id,
+                username: peer.username,
                 registration_id: upload.registration_id,
                 identity_key: upload.identity_key,
                 signed_pre_key: upload.signed_pre_key,
@@ -1421,8 +1571,9 @@ mod tests {
             })
             .await
             .unwrap();
-            core.verify_contact("peer@gmail.com", &pin).unwrap();
-            core.encrypt("peer@gmail.com", "cancel pending")
+            core.verify_contact("df8854a1-7e70-4247-9737-584cfec3e553", &pin)
+                .unwrap();
+            core.encrypt("df8854a1-7e70-4247-9737-584cfec3e553", "cancel pending")
                 .await
                 .unwrap();
             (core, pin)
@@ -1432,7 +1583,9 @@ mod tests {
             token: "token".into(),
             expires_at: 0,
             core,
-            contact_identity_changes: BTreeSet::from(["peer@gmail.com".into()]),
+            contact_identity_changes: BTreeSet::from([
+                "df8854a1-7e70-4247-9737-584cfec3e553".into()
+            ]),
         };
         save(&path, &state).unwrap();
         let before = serde_json::to_value(&state).unwrap();
@@ -1440,7 +1593,7 @@ mod tests {
             remove_local_contact(
                 &dir.join("absent/state"),
                 &mut state,
-                "peer@gmail.com",
+                "df8854a1-7e70-4247-9737-584cfec3e553",
                 &pin
             )
             .is_err()
@@ -1450,9 +1603,19 @@ mod tests {
             serde_json::to_value(load(&path).unwrap().unwrap()).unwrap(),
             before
         );
-        remove_local_contact(&path, &mut state, "peer@gmail.com", &pin).unwrap();
+        remove_local_contact(
+            &path,
+            &mut state,
+            "df8854a1-7e70-4247-9737-584cfec3e553",
+            &pin,
+        )
+        .unwrap();
         let loaded = load(&path).unwrap().unwrap();
-        assert!(!loaded.core.has_contact("peer@gmail.com"));
+        assert!(
+            !loaded
+                .core
+                .has_contact("df8854a1-7e70-4247-9737-584cfec3e553")
+        );
         assert!(loaded.contact_identity_changes.is_empty());
         assert!(loaded.core.verified_contacts().is_empty());
         assert!(loaded.core.outbox.is_empty());
@@ -1482,222 +1645,24 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
     }
-    fn identity_fixture(claims: &Value) -> String {
-        // These fixtures exercise parsing/binding only; signature verification is
-        // separately mandatory in the backend for the token from Google's TLS API.
-        format!(
-            "{}.{}.c2lnbmF0dXJl",
-            URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#),
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap())
-        )
-    }
-    fn valid_identity_claims() -> Value {
-        serde_json::json!({"nonce":"test-nonce", "iss":"https://accounts.google.com",
-            "aud":"desktop.apps.googleusercontent.com", "exp":2000,
-            "email":"A.Lice@GMAIL.com", "email_verified":true})
-    }
-    #[test]
-    fn google_identity_binding_uses_typed_verified_gmail_claims() {
-        let claims = valid_identity_claims();
-        assert_eq!(
-            google_identity_email(
-                &identity_fixture(&claims),
-                "desktop.apps.googleusercontent.com",
-                "test-nonce",
-                1000
-            )
-            .unwrap(),
-            "alice@gmail.com"
-        );
-        let mut alternate_issuer = claims;
-        alternate_issuer["iss"] = Value::String("accounts.google.com".into());
-        assert!(
-            google_identity_email(
-                &identity_fixture(&alternate_issuer),
-                "desktop.apps.googleusercontent.com",
-                "test-nonce",
-                1000
-            )
-            .is_ok()
-        );
-    }
-    #[test]
-    fn workspace_identity_accepts_primary_and_secondary_email_domains() {
-        let mut claims = valid_identity_claims();
-        claims["email"] = serde_json::json!("alice.smith@secondary.example");
-        for hosted_domain in ["secondary.example", "primary.example"] {
-            claims["hd"] = serde_json::json!(hosted_domain);
-            assert_eq!(
-                google_identity_email(
-                    &identity_fixture(&claims),
-                    "desktop.apps.googleusercontent.com",
-                    "test-nonce",
-                    1000,
-                )
-                .unwrap(),
-                "alice.smith@secondary.example"
-            );
-        }
-    }
-    #[test]
-    fn workspace_identity_requires_typed_verified_hosted_domain_claims() {
-        let mut claims = valid_identity_claims();
-        claims["email"] = serde_json::json!("DO_NOT_ECHO@secondary.example");
-        let rejected = |claims: &Value| {
-            assert_eq!(
-                google_identity_email(
-                    &identity_fixture(claims),
-                    "desktop.apps.googleusercontent.com",
-                    "test-nonce",
-                    1000,
-                )
-                .unwrap_err()
-                .to_string(),
-                "Google identity response rejected."
-            );
-        };
-        rejected(&claims);
-        for hosted_domain in [
-            Value::Null,
-            serde_json::json!(""),
-            serde_json::json!(true),
-            serde_json::json!(123),
-            serde_json::json!(["primary.example"]),
-            serde_json::json!({"domain": "primary.example"}),
-            serde_json::json!("DO_NOT_ECHO.invalid domain"),
-            serde_json::json!("https://DO_NOT_ECHO.example"),
-        ] {
-            claims["hd"] = hosted_domain;
-            rejected(&claims);
-        }
-        claims["hd"] = serde_json::json!("primary.example");
-        for verified in [
-            serde_json::json!(false),
-            serde_json::json!("true"),
-            serde_json::json!(1),
-            Value::Null,
-        ] {
-            claims["email_verified"] = verified;
-            rejected(&claims);
-        }
-    }
-    #[test]
-    fn malformed_or_unbound_google_claims_are_rejected_without_echoing_data() {
-        let invalid_fields = [
-            ("nonce", serde_json::json!("DO_NOT_ECHO")),
-            ("iss", serde_json::json!("https://DO_NOT_ECHO.example")),
-            ("iss", serde_json::json!(123)),
-            (
-                "aud",
-                serde_json::json!("DO_NOT_ECHO.apps.googleusercontent.com"),
-            ),
-            (
-                "aud",
-                serde_json::json!(["desktop.apps.googleusercontent.com"]),
-            ),
-            ("exp", serde_json::json!(1000)),
-            ("exp", serde_json::json!(0)),
-            ("exp", serde_json::json!("2000")),
-            ("exp", serde_json::json!(1.5)),
-            ("email_verified", serde_json::json!(false)),
-            ("email_verified", serde_json::json!("true")),
-            ("email_verified", serde_json::json!(1)),
-            ("email_verified", Value::Null),
-            ("email", serde_json::json!("DO_NOT_ECHO@example.com")),
-            ("email", serde_json::json!("alice+DO_NOT_ECHO@gmail.com")),
-            ("email", serde_json::json!("alice@gmail.com\nDO_NOT_ECHO")),
-            ("email", serde_json::json!(false)),
-        ];
-        for (key, value) in invalid_fields {
-            let mut claims = valid_identity_claims();
-            claims[key] = value;
-            let error = google_identity_email(
-                &identity_fixture(&claims),
-                "desktop.apps.googleusercontent.com",
-                "test-nonce",
-                1000,
-            )
-            .unwrap_err();
-            assert_eq!(error.to_string(), "Google identity response rejected.");
-        }
-        let mut missing = valid_identity_claims();
-        missing.as_object_mut().unwrap().remove("email_verified");
-        assert!(
-            google_identity_email(
-                &identity_fixture(&missing),
-                "desktop.apps.googleusercontent.com",
-                "test-nonce",
-                1000
-            )
-            .is_err()
-        );
-        for token in ["DO_NOT_ECHO", "a.b", "a.b.c.d", "a.@@@@.c", "a..c"] {
-            assert_eq!(
-                google_identity_email(
-                    token,
-                    "desktop.apps.googleusercontent.com",
-                    "test-nonce",
-                    1000
-                )
-                .unwrap_err()
-                .to_string(),
-                "Google identity response rejected."
-            );
-        }
-        let duplicate = format!("{}.{}.c2ln", URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#), URL_SAFE_NO_PAD.encode(br#"{"nonce":"test-nonce","iss":"accounts.google.com","aud":"desktop.apps.googleusercontent.com","exp":2000,"email":"alice@gmail.com","email_verified":false,"email_verified":true}"#));
-        assert!(
-            google_identity_email(
-                &duplicate,
-                "desktop.apps.googleusercontent.com",
-                "test-nonce",
-                1000
-            )
-            .is_err()
-        );
-        let unsigned = format!(
-            "{}.{}.c2ln",
-            URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&valid_identity_claims()).unwrap())
-        );
-        assert!(
-            google_identity_email(
-                &unsigned,
-                "desktop.apps.googleusercontent.com",
-                "test-nonce",
-                1000
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn backend_cannot_replace_the_google_authenticated_local_email() {
-        let mut login = LoginResponse {
-            token: "DO_NOT_ECHO_TOKEN".into(),
-            email: "alice@gmail.com".into(),
-            expires_at: 2000,
-        };
-        assert!(bind_login_email(&login, "alice@gmail.com").is_ok());
-        login.email = "DO_NOT_ECHO_OTHER@gmail.com".into();
-        let error = bind_login_email(&login, "alice@gmail.com")
-            .unwrap_err()
-            .to_string();
-        assert!(!error.contains("DO_NOT_ECHO"));
-        assert!(!error.contains("alice@gmail.com"));
-    }
     #[test]
     fn blocked_recipient_does_not_starve_other_pending_messages() {
         let dir = directory();
         let path = dir.join("state");
-        let mut core = futures::executor::block_on(State::initialize("test@gmail.com")).unwrap();
+        let mut core = futures::executor::block_on(State::initialize(
+            "87924606-b413-4a8a-8eee-ae8868531fbb",
+            "u87924606",
+        ))
+        .unwrap();
         let blocked = SendRequest {
             id: uuid::Uuid::new_v4().to_string(),
-            recipient: "blocked@gmail.com".into(),
+            recipient: "5341c71b-3486-472c-bb39-bc85e63cedeb".into(),
             envelope: "original-ciphertext-1".into(),
             expires_at: test_deadline(),
         };
         let accepted = SendRequest {
             id: uuid::Uuid::new_v4().to_string(),
-            recipient: "accepted@gmail.com".into(),
+            recipient: "6e9e8b94-eb96-4b6f-99ca-6b59efc61cf0".into(),
             envelope: "original-ciphertext-2".into(),
             expires_at: test_deadline(),
         };
@@ -1737,11 +1702,15 @@ mod tests {
     fn authentication_and_persistence_failures_stop_outbox_processing() {
         let dir = directory();
         let path = dir.join("state");
-        let mut core = futures::executor::block_on(State::initialize("test@gmail.com")).unwrap();
+        let mut core = futures::executor::block_on(State::initialize(
+            "87924606-b413-4a8a-8eee-ae8868531fbb",
+            "u87924606",
+        ))
+        .unwrap();
         core.outbox = (0..2)
             .map(|_| SendRequest {
                 id: uuid::Uuid::new_v4().to_string(),
-                recipient: "other@gmail.com".into(),
+                recipient: "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130".into(),
                 envelope: "ciphertext".into(),
                 expires_at: test_deadline(),
             })
@@ -1782,11 +1751,16 @@ mod tests {
         let dir = directory();
         let path = dir.join("state");
         let mut core = futures::executor::block_on(async {
-            let mut core = State::initialize("test@gmail.com").await.unwrap();
-            let peer = State::initialize("blocked@gmail.com").await.unwrap();
+            let mut core = State::initialize("87924606-b413-4a8a-8eee-ae8868531fbb", "u87924606")
+                .await
+                .unwrap();
+            let peer = State::initialize("5341c71b-3486-472c-bb39-bc85e63cedeb", "u5341c71b")
+                .await
+                .unwrap();
             let upload = peer.key_upload();
             core.add_contact(KeyBundle {
-                email: peer.email,
+                account_id: peer.account_id,
+                username: peer.username,
                 registration_id: upload.registration_id,
                 identity_key: upload.identity_key,
                 signed_pre_key: upload.signed_pre_key,
@@ -1799,13 +1773,13 @@ mod tests {
         });
         let blocked = SendRequest {
             id: uuid::Uuid::new_v4().to_string(),
-            recipient: "blocked@gmail.com".into(),
+            recipient: "5341c71b-3486-472c-bb39-bc85e63cedeb".into(),
             envelope: "original-old-session-ciphertext".into(),
             expires_at: test_deadline(),
         };
         let other = SendRequest {
             id: uuid::Uuid::new_v4().to_string(),
-            recipient: "other@gmail.com".into(),
+            recipient: "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130".into(),
             envelope: "unaffected-ciphertext".into(),
             expires_at: test_deadline(),
         };
@@ -1824,7 +1798,10 @@ mod tests {
                 .is_err()
         );
         assert_eq!(serde_json::to_value(&state).unwrap(), before);
-        assert!(block_changed_contact(&path, &mut state, "unknown@gmail.com").is_err());
+        assert!(
+            block_changed_contact(&path, &mut state, "c4601873-b3a2-41c6-938d-a614a9c3bcb9")
+                .is_err()
+        );
         block_changed_contact(&path, &mut state, &blocked.recipient).unwrap();
         state = load(&path).unwrap().unwrap();
         assert!(state.ensure_contact_ready(&blocked.recipient).is_err());
@@ -1863,13 +1840,21 @@ mod tests {
         let dir = directory();
         let path = dir.join("state");
         let (core, group_id, already_accepted) = futures::executor::block_on(async {
-            let mut core = State::initialize("test@gmail.com").await.unwrap();
-            for email in ["blocked@gmail.com", "other@gmail.com"] {
-                let peer = State::initialize(email).await.unwrap();
+            let mut core = State::initialize("87924606-b413-4a8a-8eee-ae8868531fbb", "u87924606")
+                .await
+                .unwrap();
+            for account_id in [
+                "5341c71b-3486-472c-bb39-bc85e63cedeb",
+                "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130",
+            ] {
+                let peer = State::initialize(account_id, &format!("u{}", &account_id[..8]))
+                    .await
+                    .unwrap();
                 let upload = peer.key_upload();
                 let contact = core
                     .add_contact(KeyBundle {
-                        email: email.into(),
+                        account_id: account_id.into(),
+                        username: peer.username.clone(),
                         registration_id: upload.registration_id,
                         identity_key: upload.identity_key,
                         signed_pre_key: upload.signed_pre_key,
@@ -1878,13 +1863,16 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                core.verify_contact(email, contact["fingerprint"].as_str().unwrap())
+                core.verify_contact(account_id, contact["fingerprint"].as_str().unwrap())
                     .unwrap();
             }
             let group = core
                 .create_group(
                     "Test",
-                    &["blocked@gmail.com".into(), "other@gmail.com".into()],
+                    &[
+                        "5341c71b-3486-472c-bb39-bc85e63cedeb".into(),
+                        "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130".into(),
+                    ],
                 )
                 .unwrap();
             let first = core
@@ -1893,7 +1881,7 @@ mod tests {
                 .unwrap();
             let accepted = first
                 .iter()
-                .find(|leg| leg.recipient == "other@gmail.com")
+                .find(|leg| leg.recipient == "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130")
                 .unwrap()
                 .id
                 .clone();
@@ -1920,7 +1908,7 @@ mod tests {
         );
         let unrelated = SendRequest {
             id: uuid::Uuid::new_v4().to_string(),
-            recipient: "other@gmail.com".into(),
+            recipient: "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130".into(),
             envelope: "unrelated-direct-envelope".into(),
             expires_at: test_deadline(),
         };
@@ -1928,22 +1916,28 @@ mod tests {
         save(&path, &state).unwrap();
         let original = serde_json::to_value(&state).unwrap();
         assert!(
-            block_changed_contact(&dir.join("absent/state"), &mut state, "blocked@gmail.com")
-                .is_err()
+            block_changed_contact(
+                &dir.join("absent/state"),
+                &mut state,
+                "5341c71b-3486-472c-bb39-bc85e63cedeb"
+            )
+            .is_err()
         );
         assert_eq!(serde_json::to_value(&state).unwrap(), original);
         // A legacy sidecar warning is reconciled even if core invalidation was
         // never saved. The unchanged member's group leg is blocked as well.
         state
             .contact_identity_changes
-            .insert("blocked@gmail.com".into());
+            .insert("5341c71b-3486-472c-bb39-bc85e63cedeb".into());
         save(&path, &state).unwrap();
         assert!(state.ensure_group_ready(&group_id).is_err());
         let other_group_leg = state
             .core
             .outbox
             .iter()
-            .find(|leg| leg.recipient == "other@gmail.com" && leg.id != unrelated.id)
+            .find(|leg| {
+                leg.recipient == "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130" && leg.id != unrelated.id
+            })
             .unwrap();
         assert!(state.ensure_outgoing_ready(other_group_leg).is_err());
         let mut attempted = Vec::new();
@@ -1978,19 +1972,23 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     fn expired_local_state() -> LocalState {
-        let mut core = futures::executor::block_on(State::initialize("test@gmail.com")).unwrap();
+        let mut core = futures::executor::block_on(State::initialize(
+            "87924606-b413-4a8a-8eee-ae8868531fbb",
+            "u87924606",
+        ))
+        .unwrap();
         let expires_at = test_deadline() - MESSAGE_LIFETIME_SECONDS;
         let id = uuid::Uuid::new_v4().to_string();
         core.outbox.push(SendRequest {
             id: id.clone(),
-            recipient: "other@gmail.com".into(),
+            recipient: "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130".into(),
             envelope: "expired-ciphertext".into(),
             expires_at,
         });
         core.messages.push(isyeet_client::LocalMessage {
             id,
-            sender: core.email.clone(),
-            recipient: "other@gmail.com".into(),
+            sender: core.account_id.clone(),
+            recipient: "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130".into(),
             text: Some("expired-local-text".into()),
             security_alert: None,
             duplicate: false,
@@ -2073,7 +2071,11 @@ mod tests {
         let path = dir.join("state");
         let first = lock_state(&path).unwrap();
         assert!(lock_state(&path).is_err());
-        let core = futures::executor::block_on(State::initialize("test@gmail.com")).unwrap();
+        let core = futures::executor::block_on(State::initialize(
+            "87924606-b413-4a8a-8eee-ae8868531fbb",
+            "u87924606",
+        ))
+        .unwrap();
         let mut state = LocalState {
             server: "https://example.com".into(),
             token: "old".into(),
@@ -2111,8 +2113,8 @@ mod tests {
     #[test]
     fn every_message_post_has_fixed_size_and_unchanged_semantics() {
         for recipient in [
-            "a@gmail.com".to_owned(),
-            format!("{}@{}.example", "a".repeat(64), "b".repeat(63)),
+            "75f4499b-5920-4d38-b057-e967e297590a".to_owned(),
+            "00000000-0000-4000-8000-000000000001".to_owned(),
         ] {
             let message = SendRequest {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -2139,11 +2141,15 @@ mod tests {
     fn a_cover_slot_sends_one_envelope_and_an_uncertain_send_keeps_the_original() {
         let dir = directory();
         let path = dir.join("state");
-        let mut core = futures::executor::block_on(State::initialize("test@gmail.com")).unwrap();
+        let mut core = futures::executor::block_on(State::initialize(
+            "87924606-b413-4a8a-8eee-ae8868531fbb",
+            "u87924606",
+        ))
+        .unwrap();
         core.set_traffic_mode(true).unwrap();
         let message = SendRequest {
             id: uuid::Uuid::new_v4().to_string(),
-            recipient: "peer@gmail.com".into(),
+            recipient: "df8854a1-7e70-4247-9737-584cfec3e553".into(),
             envelope: "saved-ciphertext-one".into(),
             expires_at: test_deadline(),
         };
@@ -2151,7 +2157,7 @@ mod tests {
             message.clone(),
             SendRequest {
                 id: uuid::Uuid::new_v4().to_string(),
-                recipient: "other@gmail.com".into(),
+                recipient: "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130".into(),
                 envelope: "saved-ciphertext-two".into(),
                 expires_at: test_deadline(),
             },
@@ -2183,7 +2189,7 @@ mod tests {
         send_slot(&path, &mut state, |sent| {
             calls += 1;
             assert_eq!(
-                sent.recipient, "other@gmail.com",
+                sent.recipient, "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130",
                 "An unavailable recipient must not monopolize later slots."
             );
             Ok(202)
@@ -2228,11 +2234,15 @@ mod tests {
     fn regular_flush_cannot_bypass_cover_scheduling_even_with_unreachable_service() {
         let dir = directory();
         let path = dir.join("state");
-        let mut core = futures::executor::block_on(State::initialize("test@gmail.com")).unwrap();
+        let mut core = futures::executor::block_on(State::initialize(
+            "87924606-b413-4a8a-8eee-ae8868531fbb",
+            "u87924606",
+        ))
+        .unwrap();
         core.set_traffic_mode(true).unwrap();
         core.outbox.push(SendRequest {
             id: uuid::Uuid::new_v4().to_string(),
-            recipient: "peer@gmail.com".into(),
+            recipient: "df8854a1-7e70-4247-9737-584cfec3e553".into(),
             envelope: "saved-ciphertext".into(),
             expires_at: test_deadline(),
         });
@@ -2270,22 +2280,6 @@ mod tests {
             serde_json::to_value(stored.core.key_upload()).unwrap(),
             serde_json::to_value(state.core.key_upload()).unwrap()
         );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn desktop_config_extracts_credentials_not_untrusted_endpoints() {
-        let dir = directory();
-        let path = dir.join("oauth.json");
-        std::fs::write(&path, br#"{"installed":{"client_id":"desktop.apps.googleusercontent.com","client_secret":"secret","auth_uri":"https://attacker.invalid"}}"#).unwrap();
-        let (id, secret) = desktop_config(&path).unwrap();
-        assert_eq!(id, "desktop.apps.googleusercontent.com");
-        assert_eq!(secret.as_deref(), Some("secret"));
-        std::fs::write(
-            &path,
-            br#"{"web":{"client_id":"web.apps.googleusercontent.com"}}"#,
-        )
-        .unwrap();
-        assert!(desktop_config(&path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
     fn maintenance_http_request(stream: &mut std::net::TcpStream) -> (String, Value) {
@@ -2330,7 +2324,11 @@ mod tests {
         let dir = directory();
         let path = dir.join("state");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut core = futures::executor::block_on(State::initialize("test@gmail.com")).unwrap();
+        let mut core = futures::executor::block_on(State::initialize(
+            "87924606-b413-4a8a-8eee-ae8868531fbb",
+            "u87924606",
+        ))
+        .unwrap();
         core.confirm_initial_upload().unwrap();
         let mut inventory = KeyMaintenanceState {
             generation: 0,
@@ -2350,13 +2348,13 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             assert_eq!(
                 maintenance_http_request(&mut stream).0,
-                "GET /v1/keys/maintenance HTTP/1.1"
+                "GET /v2/keys/maintenance HTTP/1.1"
             );
             maintenance_http_response(&mut stream, &serde_json::to_value(inventory).unwrap());
             drop(stream);
             let (mut stream, _) = listener.accept().unwrap();
             let (method, first) = maintenance_http_request(&mut stream);
-            assert_eq!(method, "PUT /v1/keys/maintenance HTTP/1.1");
+            assert_eq!(method, "PUT /v2/keys/maintenance HTTP/1.1");
             let disk = load(&saved_path).unwrap().unwrap();
             assert_eq!(
                 serde_json::to_value(disk.core.pending_key_maintenance().unwrap()).unwrap(),
@@ -2372,7 +2370,7 @@ mod tests {
             drop(stream); // Uncertain response: relay may already have committed.
             let (mut stream, _) = listener.accept().unwrap();
             let (method, retry) = maintenance_http_request(&mut stream);
-            assert_eq!(method, "PUT /v1/keys/maintenance HTTP/1.1");
+            assert_eq!(method, "PUT /v2/keys/maintenance HTTP/1.1");
             assert_eq!(retry, first);
             assert_eq!(
                 serde_json::to_value(
@@ -2414,7 +2412,11 @@ mod tests {
         let dir = directory();
         let path = dir.join("state");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let core = futures::executor::block_on(State::initialize("test@gmail.com")).unwrap();
+        let core = futures::executor::block_on(State::initialize(
+            "87924606-b413-4a8a-8eee-ae8868531fbb",
+            "u87924606",
+        ))
+        .unwrap();
         let public = serde_json::to_value(core.key_upload()).unwrap();
         let inventory = KeyMaintenanceState {
             generation: 0,
@@ -2433,7 +2435,7 @@ mod tests {
             for attempt in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let (method, body) = maintenance_http_request(&mut stream);
-                assert_eq!(method, "PUT /v1/keys HTTP/1.1");
+                assert_eq!(method, "PUT /v2/keys HTTP/1.1");
                 assert_eq!(body, public);
                 assert!(
                     load(&saved_path)
@@ -2449,7 +2451,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             assert_eq!(
                 maintenance_http_request(&mut stream).0,
-                "GET /v1/keys/maintenance HTTP/1.1"
+                "GET /v2/keys/maintenance HTTP/1.1"
             );
             assert!(
                 !load(&saved_path)
@@ -2475,7 +2477,11 @@ mod tests {
             let dir = directory();
             let path = dir.join("state");
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let core = futures::executor::block_on(State::initialize("test@gmail.com")).unwrap();
+            let core = futures::executor::block_on(State::initialize(
+                "87924606-b413-4a8a-8eee-ae8868531fbb",
+                "u87924606",
+            ))
+            .unwrap();
             let mut foreign = core.key_upload();
             foreign.signed_pre_key.signature = "changed key".into();
             let mut state = LocalState {
@@ -2491,7 +2497,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 assert_eq!(
                     maintenance_http_request(&mut stream).0,
-                    "GET /v1/keys/me HTTP/1.1"
+                    "GET /v2/keys/me HTTP/1.1"
                 );
                 if changed {
                     maintenance_http_response(&mut stream, &serde_json::to_value(foreign).unwrap());
@@ -2503,7 +2509,8 @@ mod tests {
             });
             let login = LoginResponse {
                 token: "new-generation-session".into(),
-                email: "test@gmail.com".into(),
+                account_id: "87924606-b413-4a8a-8eee-ae8868531fbb".into(),
+                username: "u87924606".into(),
                 expires_at: test_deadline(),
             };
             assert!(bind_existing_login(&client().unwrap(), &mut state, login).is_err());

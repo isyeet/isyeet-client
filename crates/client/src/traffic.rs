@@ -154,8 +154,8 @@ impl State {
         self.traffic
             .peers
             .iter()
-            .filter(|(email, peer)| {
-                self.fresh_consent(email, peer, current)
+            .filter(|(account_id, peer)| {
+                self.fresh_consent(account_id, peer, current)
                     && peer
                         .outstanding
                         .iter()
@@ -163,26 +163,26 @@ impl State {
                         .count()
                         < MAX_OUTSTANDING
             })
-            .map(|(email, _)| email.clone())
+            .map(|(account_id, _)| account_id.clone())
             .collect()
     }
-    fn traffic_pin(&self, email: &str) -> Option<String> {
-        if email == self.email || !self.verified.contains(email) {
+    fn traffic_pin(&self, account_id: &str) -> Option<String> {
+        if account_id == self.account_id || !self.verified.contains(account_id) {
             return None;
         }
-        let pin = fingerprint(self.identities.known.get(email)?).ok()?;
-        if self.group_identity_warnings.get(email) == Some(&pin) {
+        let pin = fingerprint(self.identities.known.get(account_id)?).ok()?;
+        if self.group_identity_warnings.get(account_id) == Some(&pin) {
             return None;
         }
         Some(pin)
     }
-    fn fresh_consent(&self, email: &str, peer: &Peer, current: i64) -> bool {
+    fn fresh_consent(&self, account_id: &str, peer: &Peer, current: i64) -> bool {
         let current = self.traffic_current(current);
         peer.consent
             && peer.advertised_at > 0
             && peer.advertised_at <= current.saturating_add(MESSAGE_FUTURE_SKEW_SECONDS)
             && peer.advertised_at.saturating_add(CONSENT_SECONDS) > current
-            && self.traffic_pin(email).as_ref() == Some(&peer.fingerprint)
+            && self.traffic_pin(account_id).as_ref() == Some(&peer.fingerprint)
     }
     fn cover_budget(&self, current: i64) -> usize {
         CREATION_BUDGET.saturating_sub(
@@ -374,7 +374,7 @@ impl State {
         Ok(LocalMessage {
             id: id.to_owned(),
             sender: sender.to_owned(),
-            recipient: self.email.clone(),
+            recipient: self.account_id.clone(),
             text: None,
             security_alert: None,
             duplicate: false,
@@ -392,8 +392,8 @@ impl State {
             cover: true,
         })
     }
-    pub(super) fn invalidate_traffic_peer(&mut self, email: &str) {
-        if let Some(peer) = self.traffic.peers.get_mut(email) {
+    pub(super) fn invalidate_traffic_peer(&mut self, account_id: &str) {
+        if let Some(peer) = self.traffic.peers.get_mut(account_id) {
             peer.consent = false;
             peer.receipts.clear();
             let ids: BTreeSet<_> = peer.outstanding.iter().map(|entry| &entry.id).collect();
@@ -407,9 +407,9 @@ impl State {
             .traffic
             .peers
             .iter()
-            .flat_map(|(email, peer)| {
+            .flat_map(|(account_id, peer)| {
                 let cancel = !self.quiet_confirmation_fresh(current)
-                    || !self.fresh_consent(email, peer, current);
+                    || !self.fresh_consent(account_id, peer, current);
                 peer.outstanding
                     .iter()
                     .filter(move |entry| cancel || entry.expires_at <= current)
@@ -425,16 +425,19 @@ impl State {
             .traffic
             .peers
             .keys()
-            .filter_map(|email| self.traffic_pin(email).map(|pin| (email.clone(), pin)))
+            .filter_map(|account_id| {
+                self.traffic_pin(account_id)
+                    .map(|pin| (account_id.clone(), pin))
+            })
             .collect();
-        self.traffic.peers.retain(|email, peer| {
+        self.traffic.peers.retain(|account_id, peer| {
             peer.outstanding.retain(|entry| entry.expires_at > current);
             peer.receipts.retain(|entry| entry.expires_at > current);
             // Reservations retain their captured identity across replacement;
             // new pins cannot acknowledge old covers or reset the eight-cover
             // allowance. Empty stale peer records expire to keep the cache bounded.
             !peer.outstanding.is_empty()
-                || (pins.get(email) == Some(&peer.fingerprint)
+                || (pins.get(account_id) == Some(&peer.fingerprint)
                     && (!peer.receipts.is_empty()
                         || peer.advertised_at.saturating_add(MESSAGE_LIFETIME_SECONDS) > current))
         });

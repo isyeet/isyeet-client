@@ -6,13 +6,20 @@ import Security
 final class AppModel: ObservableObject {
     @Published private(set) var canCancelAccountOperation = false
     @Published private(set) var canDiscardAccountOperation = false
-    @Published private(set) var replacedDeviceEmail: String?
+    @Published private(set) var replacedDeviceAccountID: String?
     @Published private(set) var pendingAccountOperation: AccountOperationKind?
-    @Published private(set) var pendingAccountEmail: String?
-    @Published private(set) var reenrollmentEmail: String?
+    @Published private(set) var pendingAccountID: String?
+    @Published private(set) var reenrollmentAccountID: String?
     @Published private(set) var accountLifecycleSequence: UInt64 = 0
     private var operationIntent: AccountOperation?
-    @Published private(set) var snapshot: Snapshot?
+    @Published private(set) var snapshot: Snapshot? {
+        didSet {
+            if snapshot?.account_id != oldValue?.account_id || snapshot?.fingerprint != oldValue?.fingerprint {
+                deviceAuthority = nil
+                clearDevicePairingReview()
+            }
+        }
+    }
     @Published private(set) var busy = false
     @Published private(set) var checkingInbox = false
     @Published private(set) var needsAuthentication = true
@@ -67,7 +74,14 @@ final class AppModel: ObservableObject {
         }
     }
     private let core = CryptoBridge()
-    private let oauth = GoogleOAuth()
+    private let passkeyProvider = Passkeys()
+    @Published private(set) var passkeys: [RegisteredPasskey] = []
+    @Published private(set) var deviceAuthority: DeviceAuthoritySnapshot?
+    @Published private(set) var devicePairingReview: DeviceLinkInspection?
+    private var devicePairingCode: String?
+    var experimentalDeviceAuthorizationAvailable: Bool { DeviceAuthorizationFeature.enabled && !isProduction }
+    @Published private(set) var legacyAccountPresent = false
+    private var reenrollmentUsername: String?
     private var account: StoredAccount?
     private var lockedAccount: StoredAccount?
     private var lockedExpiry: Int64?
@@ -103,14 +117,14 @@ final class AppModel: ObservableObject {
         scheduleCoverTraffic()
     }
 
-    func conversationDidAppear(_ email: String) {
-        readContext.visibleConversation = email
+    func conversationDidAppear(_ account_id: String) {
+        readContext.visibleConversation = account_id
         maintainLocalMessages()
         updateReadVisibility()
     }
 
-    func conversationDidDisappear(_ email: String) {
-        if readContext.visibleConversation == email { readContext.visibleConversation = nil }
+    func conversationDidDisappear(_ account_id: String) {
+        if readContext.visibleConversation == account_id { readContext.visibleConversation = nil }
     }
 
     func setPresentationCovered(_ identifier: String, covered: Bool) {
@@ -159,7 +173,7 @@ final class AppModel: ObservableObject {
             }
             operationIntent = nil
             pendingAccountOperation = nil
-            pendingAccountEmail = nil
+            pendingAccountID = nil
             if let stored = try vault.load() {
                 guard stored.backend == configuration.server.absoluteString else { throw SafetyError.accountMismatch }
                 if stored.identityReplaced {
@@ -167,7 +181,7 @@ final class AppModel: ObservableObject {
                     lockedAccount = stored
                     snapshot = nil
                     needsAuthentication = true
-                    replacedDeviceEmail = stored.email
+                    replacedDeviceAccountID = stored.account_id
                     stopCoverSchedule()
                     fatalError = nil
                     try maintainLockedAccount()
@@ -181,10 +195,13 @@ final class AppModel: ObservableObject {
             }
             fatalError = nil
             scheduleExpiry()
+        } catch SafetyError.legacyAccount {
+            legacyAccountPresent = true
+            hideMessagesAfterMaintenanceFailure(SafetyError.legacyAccount)
         } catch { hideMessagesAfterMaintenanceFailure(error) }
     }
 
-    // This intentionally ignores network activity and OAuth session validity.
+    // This intentionally ignores network activity and login session validity.
     // A suspended network request must never delay removal from the screen.
     func maintainLocalMessages() {
         guard fatalError == nil else { return }
@@ -204,8 +221,8 @@ final class AppModel: ObservableObject {
     // Their original expiry deadlines still run without authentication/network.
     private func maintainLockedAccount() throws {
         guard var proposed = lockedAccount else { return }
-        for email in Set(proposed.contactIdentityChanges) {
-            let result = try core.call("block_groups_for_contact", state: proposed.core, fields: ["email": .string(email)])
+        for account_id in Set(proposed.contactIdentityChanges) {
+            let result = try core.call("block_groups_for_contact", state: proposed.core, fields: ["account_id": .string(account_id)])
             guard let state = result.state else { throw SafetyError.persistence }
             proposed.core = state
         }
@@ -447,52 +464,114 @@ final class AppModel: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
-        #if DEBUG && targetEnvironment(simulator)
-        guard fatalError == nil, let configuration, let email = configuration.simulatorDevelopmentEmail else { return }
-        await run {
-            let login = try await API(base: configuration.server).simulatorDevelopmentLogin(email: email)
-            try await acceptLogin(login, configuration: configuration)
-            try await synchronize()
-            if let fingerprint = snapshot?.fingerprint {
-                let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("simulator-public-fingerprint.txt")
-                try Data(fingerprint.utf8).write(to: url, options: .atomic)
-            }
-        }
-        let environment = ProcessInfo.processInfo.environment
-        if let email = environment["ISYEET_SIMULATOR_CONTACT_EMAIL"],
-           let fingerprint = environment["ISYEET_SIMULATOR_CONTACT_FINGERPRINT"] {
-            await addContact(email)
-            await verifyContact(email: email, fingerprint: fingerprint)
-            if let text = environment["ISYEET_SIMULATOR_SEND_TEXT"] { _ = await send(text: text, recipient: email) }
-        }
-        #endif
+
     }
 
-    func signIn() async {
+    private func authenticatePasskey(username: String? = nil) async throws -> LoginResponse {
+        guard let configuration else { throw SafetyError.configuration }
+        let api = API(base: configuration.server)
+        let challenge: PasskeyChallenge
+        if let username { challenge = try await api.registrationStart(username: MessageSafety.canonicalUsername(username)) }
+        else { challenge = try await api.loginStart() }
+        let credential = try await passkeyProvider.credential(challenge, configuration: configuration, registering: username != nil)
+        let login = try await api.loginFinish(challengeID: challenge.challenge_id, credential: credential, registering: username != nil)
+        if let username {
+            guard login.username == username, login.account_id == challenge.account_id, challenge.username == username else { throw SafetyError.accountMismatch }
+        }
+        return login
+    }
+
+    private func authorizeAction(login: LoginResponse, purpose: String, excludingCredentialID: String? = nil) async throws -> PasskeyAction {
+        guard let configuration else { throw SafetyError.configuration }
+        let api = API(base: configuration.server)
+        let challenge = try await api.reauthenticationStart(token: login.token, purpose: purpose)
+        let credential = try await passkeyProvider.credential(challenge, configuration: configuration, registering: false, excludingCredentialID: excludingCredentialID)
+        return try await api.reauthenticationFinish(token: login.token, challengeID: challenge.challenge_id, credential: credential)
+    }
+
+    func signIn(username: String? = nil) async {
         guard !busy, fatalError == nil, operationIntent == nil, let configuration else { return }
         busy = true
         defer { busy = false }
         do {
-            let credential = try await oauth.idToken(configuration: configuration)
-            let login = try await API(base: configuration.server).login(idToken: credential.idToken)
-            guard login.email == credential.email else { throw SafetyError.accountMismatch }
+            let login = try await authenticatePasskey(username: username)
             do { try await acceptLogin(login, configuration: configuration) }
             catch SafetyError.identityAlreadyRegistered {
-                reenrollmentEmail = credential.email
+                reenrollmentAccountID = login.account_id
+                reenrollmentUsername = login.username
                 throw SafetyError.identityAlreadyRegistered
             }
-            reenrollmentEmail = nil
+            reenrollmentAccountID = nil
+            reenrollmentUsername = nil
             try await synchronize()
+        } catch { report(error) }
+    }
+
+    func refreshPasskeys() async {
+        await run {
+            let (account, api) = try authenticated()
+            passkeys = try await api.passkeys(token: account.token)
+        }
+    }
+
+    func addPasskey(label: String, securityKey: Bool) async {
+        await run {
+            guard (1...32).contains(label.utf8.count), label.utf8.allSatisfy({ (0x20...0x7e).contains($0) }) else { throw SafetyError.invalidPasskeyLabel }
+            let (account, api) = try authenticated()
+            guard let configuration else { throw SafetyError.configuration }
+            let login = LoginResponse(token: account.token, account_id: account.account_id, username: account.username, expires_at: account.expiresAt)
+            let action = try await authorizeAction(login: login, purpose: "passkey_add")
+            let challenge = try await api.addPasskeyStart(token: account.token, actionToken: action.action_token, label: label)
+            guard challenge.account_id == account.account_id, challenge.username == account.username else { throw SafetyError.accountMismatch }
+            let credential = try await passkeyProvider.credential(challenge, configuration: configuration, registering: true, securityKey: securityKey)
+            try await api.addPasskeyFinish(token: account.token, challengeID: challenge.challenge_id, credential: credential)
+            passkeys = try await api.passkeys(token: account.token)
+        }
+    }
+
+    func removePasskey(_ passkey: RegisteredPasskey) async {
+        await run {
+            let (account, api) = try authenticated()
+            guard passkeys.count > 1, passkeys.contains(passkey) else { throw SafetyError.invalidResponse }
+            let login = LoginResponse(token: account.token, account_id: account.account_id, username: account.username, expires_at: account.expiresAt)
+            let action = try await authorizeAction(login: login, purpose: "passkey_remove", excludingCredentialID: passkey.id)
+            try await api.removePasskey(id: passkey.id, token: account.token, actionToken: action.action_token)
+            passkeys = []
+            guard var latest = self.account else { throw SafetyError.persistence }
+            latest.token = ""
+            latest.expiresAt = 0
+            try persist(latest)
+            needsAuthentication = true
+            alert = "Passkey removed. Sign in again with a remaining passkey. Removing a synced passkey invalidates every copy of that credential."
+        }
+    }
+
+    func displayName(_ accountID: String) -> String {
+        if snapshot?.account_id == accountID, let username = snapshot?.username { return "@" + username }
+        if let contact = snapshot?.contacts.first(where: { $0.account_id == accountID }) { return "@" + contact.username }
+        if accountID == lockedAccount?.account_id, let username = lockedAccount?.username { return "@" + username }
+        if accountID == reenrollmentAccountID, let username = reenrollmentUsername { return "@" + username }
+        if accountID == operationIntent?.account_id, let username = operationIntent?.username { return "@" + username }
+        return accountID
+    }
+
+    func discardLegacyLocalAccount() {
+        guard legacyAccountPresent, !busy else { return }
+        do {
+            try vault.deleteAccount()
+            try vault.clearOperation()
+            legacyAccountPresent = false
+            fatalError = nil
+            loadAccount()
         } catch { report(error) }
     }
 
     private func pauseForAccountOperation(_ operation: AccountOperation) throws {
         operationIntent = operation
         canCancelAccountOperation = false
-        canDiscardAccountOperation = false
+        canDiscardAccountOperation = operation.expiresAt <= Int64(Date().timeIntervalSince1970)
         pendingAccountOperation = operation.kind
-        pendingAccountEmail = operation.email
+        pendingAccountID = operation.account_id
         lockedAccount = try account ?? lockedAccount ?? vault.load()
         account = nil
         snapshot = nil
@@ -515,68 +594,82 @@ final class AppModel: ObservableObject {
 
     private func beginAccountOperation(_ kind: AccountOperationKind) async {
         guard !busy, fatalError == nil, operationIntent == nil, let configuration else { return }
-        let target = kind == .delete ? account?.email : reenrollmentEmail
+        let target = kind == .delete ? account?.account_id : reenrollmentAccountID
         let pinnedIdentity = kind == .delete ? snapshot?.fingerprint : nil
         guard let target, kind != .delete || pinnedIdentity != nil else { return }
         busy = true
         defer { busy = false }
         do {
-            let credential = try await oauth.idToken(configuration: configuration)
-            guard credential.email == target, fatalError == nil else { throw SafetyError.accountMismatch }
+            let login = try await authenticatePasskey()
+            guard login.account_id == target, fatalError == nil else { throw SafetyError.accountMismatch }
             let api = API(base: configuration.server)
-            guard let remote = try await api.accountState(idToken: credential.idToken, email: target) else { throw SafetyError.accountOperationConflict }
+            guard let remote = try await api.accountState(token: login.token, account_id: target) else { throw SafetyError.accountOperationConflict }
             guard fatalError == nil else { throw SafetyError.persistence }
             var preparedCore: JSONValue?
             var preparedKeys: JSONValue?
             var preparedFingerprint: String?
             if kind == .delete {
-                guard account?.email == target, snapshot?.fingerprint == pinnedIdentity,
+                guard account?.account_id == target, snapshot?.fingerprint == pinnedIdentity,
                       (remote.identity_fingerprint == pinnedIdentity || (remote.identity_fingerprint == nil && account?.registered == false)) else { throw SafetyError.accountOperationConflict }
             } else {
                 guard account == nil, remote.identity_fingerprint != nil else { throw SafetyError.accountOperationConflict }
-                let created = try core.call("init", fields: ["email": .string(target)])
+                let created = try core.call("init", fields: ["account_id": .string(target), "username": .string(login.username)])
                 guard let state = created.state else { throw SafetyError.persistence }
                 let upload = try core.call("key_upload", state: state)
                 guard let keys = upload.data, let keyState = upload.state else { throw SafetyError.persistence }
                 let ready = try core.expire(keyState)
-                guard ready.snapshot.email == target else { throw SafetyError.invalidResponse }
+                guard ready.snapshot.account_id == target else { throw SafetyError.invalidResponse }
                 preparedCore = ready.state
                 preparedKeys = keys
                 preparedFingerprint = ready.snapshot.fingerprint
             }
-            let intent = try AccountOperation(kind: kind, backend: configuration.server.absoluteString,
-                email: target, operationID: UUID().uuidString.lowercased(), expiresAt: remote.server_time + 900,
+            let action = try await authorizeAction(login: login, purpose: kind == .delete ? "account_delete" : "account_reenroll")
+            let intent = try AccountOperation(username: login.username, actionToken: action.action_token, kind: kind, backend: configuration.server.absoluteString,
+                account_id: target, operationID: UUID().uuidString.lowercased(), expiresAt: remote.server_time + 900,
                 expectedGeneration: remote.generation, expectedFingerprint: remote.identity_fingerprint,
                 preparedCore: preparedCore, preparedKeys: preparedKeys, preparedFingerprint: preparedFingerprint).validated()
             // This durable journal is the point of no implicit cancellation.
             // No destructive HTTP request may happen before it succeeds.
             try vault.saveOperation(intent)
             try pauseForAccountOperation(intent)
-            try await finishAccountOperation(idToken: credential.idToken)
+            try await finishAccountOperation()
         } catch { report(error) }
     }
 
     func resumeAccountOperation() async {
-        guard !busy, fatalError == nil, let intent = operationIntent, let configuration else { return }
+        guard !busy, fatalError == nil, let intent = operationIntent, configuration != nil else { return }
         busy = true
         defer { busy = false }
         do {
             if intent.discardLocal { try completeLocalDiscard(); return }
             // A durably recorded deletion receipt needs only local cleanup.
             if intent.completed && intent.kind == .delete { try completeAccountDeletion(); return }
-            let credential = try await oauth.idToken(configuration: configuration)
-            guard credential.email == intent.email else { throw SafetyError.accountMismatch }
-            try await finishAccountOperation(idToken: credential.idToken)
-        } catch { report(error) }
+            do { try await finishAccountOperation() }
+            catch SafetyError.unauthorized {
+                let login = try await authenticatePasskey()
+                guard login.account_id == intent.account_id, login.username == intent.username else { throw SafetyError.accountMismatch }
+                let action = try await authorizeAction(login: login, purpose: intent.kind == .delete ? "account_delete" : "account_reenroll")
+                var refreshed = intent
+                refreshed.actionToken = action.action_token
+                try vault.saveOperation(refreshed)
+                operationIntent = refreshed
+                try await finishAccountOperation()
+            }
+        } catch {
+            if let saved = operationIntent, saved.expiresAt <= Int64(Date().timeIntervalSince1970) {
+                canDiscardAccountOperation = true
+            }
+            report(error)
+        }
     }
 
-    private func finishAccountOperation(idToken: String) async throws {
+    private func finishAccountOperation() async throws {
         guard var intent = operationIntent, let configuration, fatalError == nil else { throw SafetyError.persistence }
         let api = API(base: configuration.server)
         if !intent.completed {
-            do { try await api.performAccountOperation(intent, idToken: idToken) }
+            do { try await api.performAccountOperation(intent) }
             catch SafetyError.accountOperationConflict {
-                if try await reconcileAccountOperation(idToken: idToken) { return }
+                if try await reconcileAccountOperation() { return }
                 throw SafetyError.accountOperationConflict
             }
             guard fatalError == nil, operationIntent == intent else { throw SafetyError.persistence }
@@ -586,24 +679,24 @@ final class AppModel: ObservableObject {
             operationIntent = intent
         }
         if intent.kind == .delete { try completeAccountDeletion(); return }
-        do { try await activateReenrollment(intent, idToken: idToken, api: api) }
+        do { try await activateReenrollment(intent, api: api) }
         catch SafetyError.accountOperationConflict {
-            if try await reconcileAccountOperation(idToken: idToken) { return }
+            if try await reconcileAccountOperation() { return }
             throw SafetyError.accountOperationConflict
         }
     }
 
-    private func activateReenrollment(_ intent: AccountOperation, idToken: String, api: API) async throws {
-        let login = try await api.login(idToken: idToken)
-        guard login.email == intent.email else { throw SafetyError.accountMismatch }
+    private func activateReenrollment(_ intent: AccountOperation, api: API) async throws {
+        let login = try await authenticatePasskey()
+        guard login.account_id == intent.account_id, login.username == intent.username else { throw SafetyError.accountMismatch }
         guard let keys = try await api.ownKeys(token: login.token) else { throw SafetyError.accountOperationConflict }
         try intent.validateCurrentKeys(keys)
         guard fatalError == nil, operationIntent == intent, let coreState = intent.preparedCore else { throw SafetyError.persistence }
         let confirmation = try core.call("confirm_initial_upload", state: coreState)
         guard let confirmedState = confirmation.state else { throw SafetyError.persistence }
         let ready = try core.expire(confirmedState)
-        guard ready.snapshot.email == intent.email, ready.snapshot.fingerprint == intent.preparedFingerprint else { throw SafetyError.invalidResponse }
-        let restored = StoredAccount(version: 1, backend: intent.backend, email: intent.email,
+        guard ready.snapshot.account_id == intent.account_id, ready.snapshot.fingerprint == intent.preparedFingerprint else { throw SafetyError.invalidResponse }
+        let restored = StoredAccount(version: 2, backend: intent.backend, account_id: intent.account_id, username: intent.username,
             token: login.token, expiresAt: login.expires_at, core: ready.state, registered: true)
         // Until both writes finish, startup sees the intent and cannot use an
         // old identity or regenerate a second replacement after an uncertain reply.
@@ -612,20 +705,20 @@ final class AppModel: ObservableObject {
         try vault.clearOperation()
         operationIntent = nil
         pendingAccountOperation = nil
-        pendingAccountEmail = nil
-        reenrollmentEmail = nil
+        pendingAccountID = nil
+        reenrollmentAccountID = nil
         loadAccount()
         guard fatalError == nil else { throw SafetyError.persistence }
         accountLifecycleSequence &+= 1
         alert = "Re-enrollment completed. Previously issued sessions were revoked. Ask every contact to remove your old contact entry, add you again, and verify your new fingerprint outside ISYEET. Create new affected groups."
     }
 
-    private func reconcileAccountOperation(idToken: String) async throws -> Bool {
+    private func reconcileAccountOperation() async throws -> Bool {
         guard var intent = operationIntent, let configuration, fatalError == nil else { throw SafetyError.persistence }
         canCancelAccountOperation = false
         canDiscardAccountOperation = false
         let api = API(base: configuration.server)
-        let remote = try await api.accountState(idToken: idToken, email: intent.email)
+        let remote = try await api.accountState(actionToken: intent.actionToken, account_id: intent.account_id)
         guard operationIntent == intent, fatalError == nil else { throw SafetyError.persistence }
         guard let remote else {
             if intent.kind == .delete {
@@ -643,7 +736,7 @@ final class AppModel: ObservableObject {
             canDiscardAccountOperation = remote.server_time >= intent.expiresAt
             intent.completed = true
             try vault.saveOperation(intent); operationIntent = intent
-            try await activateReenrollment(intent, idToken: idToken, api: api)
+            try await activateReenrollment(intent, api: api)
             return true
         }
         if remote.generation == intent.expectedGeneration && remote.identity_fingerprint == intent.expectedFingerprint {
@@ -665,7 +758,7 @@ final class AppModel: ObservableObject {
             try vault.clearOperation()
             operationIntent = nil
             pendingAccountOperation = nil
-            pendingAccountEmail = nil
+            pendingAccountID = nil
             canCancelAccountOperation = false
             loadAccount()
         } catch { report(error) }
@@ -689,12 +782,12 @@ final class AppModel: ObservableObject {
         try vault.clearOperation()
         operationIntent = nil
         pendingAccountOperation = nil
-        pendingAccountEmail = nil
+        pendingAccountID = nil
         canDiscardAccountOperation = false
-        reenrollmentEmail = intent.email
+        reenrollmentAccountID = intent.account_id
         account = nil
         snapshot = nil
-        replacedDeviceEmail = nil
+        replacedDeviceAccountID = nil
         accountLifecycleSequence &+= 1
         alert = "This device's local account data was cleared. The server account was not changed. Sign in or explicitly choose Re-enroll this device to continue."
     }
@@ -707,9 +800,9 @@ final class AppModel: ObservableObject {
             try vault.deleteAccount()
             lockedAccount = nil
             lockedExpiry = nil
-            reenrollmentEmail = account.email
+            reenrollmentAccountID = account.account_id
             self.account = nil
-            replacedDeviceEmail = nil
+            replacedDeviceAccountID = nil
             snapshot = nil
             needsAuthentication = true
             accountLifecycleSequence &+= 1
@@ -724,8 +817,8 @@ final class AppModel: ObservableObject {
         try vault.clearOperation()
         operationIntent = nil
         pendingAccountOperation = nil
-        pendingAccountEmail = nil
-        reenrollmentEmail = nil
+        pendingAccountID = nil
+        reenrollmentAccountID = nil
         accountLifecycleSequence &+= 1
         alert = "The requested account deletion is complete, and this device's keys and history were cleared. An account created afterward is not affected. Copies held by other people cannot be erased."
     }
@@ -742,7 +835,7 @@ final class AppModel: ObservableObject {
         snapshot = nil
         unreadCounts = [:]
         needsAuthentication = true
-        replacedDeviceEmail = blocked.email
+        replacedDeviceAccountID = blocked.account_id
         stopCoverSchedule()
         expiryTask?.cancel(); expiryTask = nil
         showInbox()
@@ -754,7 +847,7 @@ final class AppModel: ObservableObject {
         var proposed: StoredAccount
         var resolvedMessageIDs: [String] = []
         if let existing = account {
-            guard existing.email == login.email else { throw SafetyError.accountMismatch }
+            guard existing.account_id == login.account_id, existing.username == login.username else { throw SafetyError.accountMismatch }
             guard !existing.identityReplaced else { throw SafetyError.deviceIdentityReplaced }
             var validatedState: JSONValue?
             do {
@@ -785,13 +878,13 @@ final class AppModel: ObservableObject {
             proposed.token = login.token
             proposed.expiresAt = login.expires_at
         } else {
-            // Google sign-in does not restore another device's private keys.
+            // Passkey sign-in does not restore another device's private keys.
             // Check before generating or saving any new local identity. The
             // server's immutable key registration still protects an upload race.
             try await API(base: configuration.server).requireUnregisteredIdentity(token: login.token)
-            let result = try core.call("init", fields: ["email": .string(login.email)])
+            let result = try core.call("init", fields: ["account_id": .string(login.account_id), "username": .string(login.username)])
             guard let state = result.state else { throw CoreError.rejected }
-            proposed = StoredAccount(version: 1, backend: configuration.server.absoluteString, email: login.email,
+            proposed = StoredAccount(version: 2, backend: configuration.server.absoluteString, account_id: login.account_id, username: login.username,
                                      token: login.token, expiresAt: login.expires_at, core: state, registered: false)
         }
         try persist(proposed, resolvedMessageIDs: resolvedMessageIDs)
@@ -800,25 +893,28 @@ final class AppModel: ObservableObject {
 
     func addContact(_ input: String) async {
         await run {
-            let email = try MessageSafety.canonicalEmail(input)
+            let username = try MessageSafety.canonicalUsername(input.hasPrefix("@") ? String(input.dropFirst()) : input)
             let (account, api) = try authenticated()
-            guard email != account.email else { throw SafetyError.selfContact }
-            if snapshot?.contacts.contains(where: { $0.email == email }) == true { return }
-            let bundle = try await api.claim(email: email, token: account.token)
+            let found = try await api.lookup(username: username, token: account.token)
+            let account_id = found.account_id
+            guard account_id != account.account_id else { throw SafetyError.selfContact }
+            if snapshot?.contacts.contains(where: { $0.account_id == account_id }) == true { return }
+            let bundle = try await api.claim(account_id: account_id, token: account.token)
+            guard case .object(let fields) = bundle, fields["username"] == .string(found.username) else { throw SafetyError.invalidResponse }
             // Expiry/read maintenance can run while the lookup is awaiting I/O.
             guard fatalError == nil, let state = self.account?.core else { throw SafetyError.persistence }
             try apply(core.call("add_contact", state: state, fields: ["bundle": bundle]))
         }
     }
 
-    func verifyContact(email: String, fingerprint: String) async {
+    func verifyContact(account_id: String, fingerprint: String) async {
         await run {
             let (account, _) = try authenticated()
             // Whitespace removal is only for a manually pasted fingerprint;
             // message text is never normalized or filtered.
             let value = fingerprint.replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "\n", with: "").lowercased()
             guard MessageSafety.validFingerprint(value) else { throw SafetyError.invalidResponse }
-            try apply(core.call("verify_contact", state: account.core, fields: ["email": .string(email), "fingerprint": .string(value)]))
+            try apply(core.call("verify_contact", state: account.core, fields: ["account_id": .string(account_id), "fingerprint": .string(value)]))
             try await synchronize()
         }
     }
@@ -829,15 +925,15 @@ final class AppModel: ObservableObject {
         defer { busy = false }
         do {
             try maintain()
-            try request.validate(current: snapshot?.contacts.first { $0.email == request.email })
+            try request.validate(current: snapshot?.contacts.first { $0.account_id == request.account_id })
             guard let state = account?.core else { throw SafetyError.persistence }
             try apply(core.call("remove_contact", state: state, fields: [
-                "email": .string(request.email), "previous_fingerprint": .string(request.previousFingerprint),
-            ]), clearIdentityChangeFor: request.email)
+                "account_id": .string(request.account_id), "previous_fingerprint": .string(request.previousFingerprint),
+            ]), clearIdentityChangeFor: request.account_id)
         } catch { return .failed(safeDescription(error)) }
         do {
             let (current, api) = try authenticated()
-            try await api.syncContacts(emails: snapshot?.contacts.filter(\.verified).map(\.email) ?? [], token: current.token)
+            try await api.syncContacts(account_ids: snapshot?.contacts.filter(\.verified).map(\.account_id) ?? [], token: current.token)
             return .removed
         } catch {
             if error as? SafetyError == .unauthorized { needsAuthentication = true }
@@ -864,9 +960,9 @@ final class AppModel: ObservableObject {
     func groupIsBlocked(_ groupID: String) -> Bool {
         guard let snapshot, let group = snapshot.groups.first(where: { $0.id == groupID }) else { return true }
         return group.blocked || group.members.contains { member in
-            guard member.email != snapshot.email else { return member.fingerprint != snapshot.fingerprint }
-            return pendingIdentityChanges.contains(member.email)
-                || !snapshot.contacts.contains { $0.email == member.email && $0.fingerprint == member.fingerprint && $0.verified }
+            guard member.account_id != snapshot.account_id else { return member.fingerprint != snapshot.fingerprint }
+            return pendingIdentityChanges.contains(member.account_id)
+                || !snapshot.contacts.contains { $0.account_id == member.account_id && $0.fingerprint == member.fingerprint && $0.verified }
         }
     }
 
@@ -878,9 +974,9 @@ final class AppModel: ObservableObject {
             try MessageGroup.validateTitle(title)
             let (current, _) = try authenticated()
             guard (1...7).contains(members.count), Set(members).count == members.count,
-                  members.allSatisfy({ email in
-                      email != current.email && !pendingIdentityChanges.contains(email)
-                          && snapshot?.contacts.contains(where: { $0.email == email && $0.verified }) == true
+                  members.allSatisfy({ account_id in
+                      account_id != current.account_id && !pendingIdentityChanges.contains(account_id)
+                          && snapshot?.contacts.contains(where: { $0.account_id == account_id && $0.verified }) == true
                   }) else { throw SafetyError.invalidGroup }
             let result = try core.call("create_group", state: current.core, fields: [
                 "title": .string(title), "members": .array(members.sorted().map(JSONValue.string)),
@@ -987,7 +1083,7 @@ final class AppModel: ObservableObject {
         }
         // Only independently verified contacts may place ciphertext in this
         // account's relay queue. Retry this idempotent update after a crash.
-        try await api.syncContacts(emails: snapshot?.contacts.filter(\.verified).map(\.email) ?? [], token: current.token)
+        try await api.syncContacts(account_ids: snapshot?.contacts.filter(\.verified).map(\.account_id) ?? [], token: current.token)
         try await reconcileTrafficMode(api, token: current.token)
         var deliveryFailed = false
         // Cover mode has exactly one sender: the independent slot scheduler.
@@ -1020,7 +1116,7 @@ final class AppModel: ObservableObject {
         var unverified = Set<String>()
         for incoming in messages {
             guard UUID(uuidString: incoming.id) != nil,
-                  try MessageSafety.canonicalEmail(incoming.sender) == incoming.sender else { throw SafetyError.invalidResponse }
+                  try MessageSafety.canonicalAccountID(incoming.sender) == incoming.sender else { throw SafetyError.invalidResponse }
             guard let state = account?.core else { throw SafetyError.persistence }
             let wire = try JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(incoming))
             do {
@@ -1043,12 +1139,12 @@ final class AppModel: ObservableObject {
                 alert = CoreError.groupCapacityReached.errorDescription
             } catch CoreError.identityChanged {
                 guard var proposed = account,
-                      let contact = snapshot?.contacts.first(where: { $0.email == incoming.sender }) else { throw SafetyError.invalidResponse }
-                observedIdentityChanges[contact.email] = contact.fingerprint
+                      let contact = snapshot?.contacts.first(where: { $0.account_id == incoming.sender }) else { throw SafetyError.invalidResponse }
+                observedIdentityChanges[contact.account_id] = contact.fingerprint
                 if !proposed.contactIdentityChanges.contains(incoming.sender) {
                     proposed.contactIdentityChanges.append(incoming.sender)
                     do {
-                        let result = try core.call("block_groups_for_contact", state: proposed.core, fields: ["email": .string(incoming.sender)])
+                        let result = try core.call("block_groups_for_contact", state: proposed.core, fields: ["account_id": .string(incoming.sender)])
                         guard let state = result.state else { throw SafetyError.persistence }
                         proposed.core = state
                         try persist(proposed, resolvedMessageIDs: result.resolved_message_ids ?? [])
@@ -1071,35 +1167,36 @@ final class AppModel: ObservableObject {
         if deliveryFailed { throw SafetyError.network }
     }
 
-    private func apply(_ result: CoreResult, arrival: StoredMessage? = nil, clearIdentityChangeFor email: String? = nil, resolvedMessageIDs: [String] = []) throws {
+    private func apply(_ result: CoreResult, arrival: StoredMessage? = nil, clearIdentityChangeFor account_id: String? = nil, resolvedMessageIDs: [String] = []) throws {
         guard fatalError == nil, var proposed = account, let state = result.state else { throw SafetyError.persistence }
         proposed.core = state
-        if let email { proposed.contactIdentityChanges.removeAll { $0 == email } }
-        try persist(proposed, arrival: arrival, resolvedMessageIDs: resolvedMessageIDs + (result.resolved_message_ids ?? []), ignoringIdentityChangeFor: email)
+        if let account_id { proposed.contactIdentityChanges.removeAll { $0 == account_id } }
+        try persist(proposed, arrival: arrival, resolvedMessageIDs: resolvedMessageIDs + (result.resolved_message_ids ?? []), ignoringIdentityChangeFor: account_id)
     }
 
-    private func persist(_ value: StoredAccount, arrival: StoredMessage? = nil, recovering: Bool = false, resolvedMessageIDs: [String] = [], ignoringIdentityChangeFor removedEmail: String? = nil) throws {
+    private func persist(_ value: StoredAccount, arrival: StoredMessage? = nil, recovering: Bool = false, resolvedMessageIDs: [String] = [], ignoringIdentityChangeFor removedAccountID: String? = nil) throws {
         guard fatalError == nil || recovering else { throw SafetyError.persistence }
         var proposed = value
         var resolvedIDs = Set(resolvedMessageIDs)
         // Reconcile warnings before any expiry call can promote quarantined
         // group text, including a new group whose sender is another member.
-        for email in Set(proposed.contactIdentityChanges) {
-            let result = try core.call("block_groups_for_contact", state: proposed.core, fields: ["email": .string(email)])
+        for account_id in Set(proposed.contactIdentityChanges) {
+            let result = try core.call("block_groups_for_contact", state: proposed.core, fields: ["account_id": .string(account_id)])
             guard let state = result.state else { throw SafetyError.persistence }
             proposed.core = state
             resolvedIDs.formUnion(result.resolved_message_ids ?? [])
         }
-        for (email, pin) in observedIdentityChanges where email != removedEmail {
+        for (account_id, pin) in observedIdentityChanges where account_id != removedAccountID {
             // A replacement may already have committed before a later save
             // failed. Never carry the old warning onto that newer identity.
             let result = try core.call("block_groups_for_contact", state: proposed.core,
-                                       fields: ["email": .string(email), "fingerprint": .string(pin)])
+                                       fields: ["account_id": .string(account_id), "fingerprint": .string(pin)])
             guard let state = result.state else { throw SafetyError.persistence }
             proposed.core = state
             resolvedIDs.formUnion(result.resolved_message_ids ?? [])
         }
         var expired = try core.expire(proposed.core)
+        guard expired.snapshot.account_id == proposed.account_id, expired.snapshot.username == proposed.username else { throw SafetyError.accountMismatch }
         resolvedIDs.formUnion(expired.snapshot.resolved_message_ids)
         var now = Int64(Date().timeIntervalSince1970)
         // A deadline can pass between the core call and the Swift clock sample.
@@ -1116,14 +1213,14 @@ final class AppModel: ObservableObject {
         }
         proposed.core = expired.state
         let display = expired.snapshot
-        guard display.email == proposed.email else { throw SafetyError.invalidResponse }
+        guard display.account_id == proposed.account_id else { throw SafetyError.invalidResponse }
         // If recording a warning failed, explicit reload must still preserve
         // that conservative block until the corresponding pin is replaced.
-        for (email, pin) in observedIdentityChanges where email != removedEmail && display.contacts.contains(where: { $0.email == email && $0.fingerprint == pin }) {
-            proposed.contactIdentityChanges.append(email)
+        for (account_id, pin) in observedIdentityChanges where account_id != removedAccountID && display.contacts.contains(where: { $0.account_id == account_id && $0.fingerprint == pin }) {
+            proposed.contactIdentityChanges.append(account_id)
         }
-        proposed.contactIdentityChanges = Array(Set(proposed.contactIdentityChanges)).filter { email in
-            display.contacts.contains { $0.email == email }
+        proposed.contactIdentityChanges = Array(Set(proposed.contactIdentityChanges)).filter { account_id in
+            display.contacts.contains { $0.account_id == account_id }
         }.sorted()
         proposed.unreadMessageIDs = UnreadMessages.updatedIDs(proposed.unreadMessageIDs, snapshot: display,
                                                              arrival: arrival, arrivals: display.messages.filter { resolvedIDs.contains($0.id) }, reading: currentReadContext, now: now)
@@ -1135,11 +1232,11 @@ final class AppModel: ObservableObject {
         if proposed != account { try vault.save(proposed) }
         // The removal is now durable, even if a later expiry write fails.
         // A reload must not replay an observed warning against a missing pin.
-        if let removedEmail { observedIdentityChanges.removeValue(forKey: removedEmail) }
+        if let removedAccountID { observedIdentityChanges.removeValue(forKey: removedAccountID) }
         if let deadline = display.nextExpiry, deadline <= Int64(Date().timeIntervalSince1970) {
             // Keychain itself can take us across a deadline. Save the newly
             // pruned proposal before publishing any result of that slow write.
-            do { try persist(proposed, arrival: arrival, recovering: recovering, resolvedMessageIDs: Array(resolvedIDs), ignoringIdentityChangeFor: removedEmail) }
+            do { try persist(proposed, arrival: arrival, recovering: recovering, resolvedMessageIDs: Array(resolvedIDs), ignoringIdentityChangeFor: removedAccountID) }
             catch {
                 // The first write succeeded. Require a reload of that durable
                 // state rather than continuing with an older in-memory ratchet.
@@ -1151,8 +1248,8 @@ final class AppModel: ObservableObject {
         account = proposed
         snapshot = display
         pendingIdentityChanges = proposed.contactIdentityChanges
-        observedIdentityChanges = observedIdentityChanges.filter { email, pin in
-            display.contacts.contains { $0.email == email && $0.fingerprint == pin }
+        observedIdentityChanges = observedIdentityChanges.filter { account_id, pin in
+            display.contacts.contains { $0.account_id == account_id && $0.fingerprint == pin }
         }
         unreadCounts = UnreadMessages.counts(proposed.unreadMessageIDs, snapshot: display, now: now)
         // Notifications can observe this only after the same durable save as the inbox.
@@ -1164,26 +1261,10 @@ final class AppModel: ObservableObject {
         if expiredUnread { retentionSequence &+= 1 }
         scheduleExpiry()
         scheduleCoverTraffic()
-        writeSimulatorTestReport()
-    }
-
-    private func writeSimulatorTestReport() {
-        #if DEBUG && targetEnvironment(simulator)
-        guard configuration?.simulatorDevelopmentEmail != nil, let snapshot,
-              let expected = ProcessInfo.processInfo.environment["ISYEET_SIMULATOR_EXPECT_TEXT"] else { return }
-        // Test assertion only: export booleans/counts, never keys, state, or text.
-        let report: [String: JSONValue] = [
-            "received_expected_text": .bool(snapshot.messages.contains { $0.sender != snapshot.email && $0.text == expected }),
-            "pending_outbox_count": .integer(Int64(snapshot.outbox.count)),
-            "security_alert_count": .integer(Int64(snapshot.messages.filter { $0.security_alert != nil }.count)),
-        ]
-        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("simulator-test-result.json")
-        try? JSONEncoder().encode(report).write(to: url, options: .atomic)
-        #endif
     }
 
     private func report(_ error: Error) {
+        if error is CancellationError { return }
         switch error {
         case CoreError.coverClockUnavailable, CoreError.coverUnavailable:
             trafficIssue = safeDescription(error)
@@ -1198,5 +1279,154 @@ final class AppModel: ObservableObject {
         if let error = error as? SafetyError { return error.errorDescription! }
         if let error = error as? CoreError { return error.errorDescription! }
         return SafetyError.network.errorDescription!
+    }
+}
+
+// This authorization-only experiment never changes the v2 message transport.
+// Every entry point is disabled outside an explicitly opted-in staging Debug build.
+extension AppModel {
+    private func deviceAuthorizationContext() throws -> (StoredAccount, API, String) {
+        guard experimentalDeviceAuthorizationAvailable else { throw SafetyError.deviceAuthorizationUnavailable }
+        let (saved, api) = try authenticated()
+        guard saved.registered, let snapshot, snapshot.account_id == saved.account_id else { throw SafetyError.invalidResponse }
+        return (saved, api, snapshot.fingerprint)
+    }
+
+    private func deviceAuthorizationState(_ saved: StoredAccount, fingerprint: String) throws -> JSONValue {
+        guard experimentalDeviceAuthorizationAvailable, fatalError == nil, operationIntent == nil,
+              let latest = account, latest.account_id == saved.account_id, latest.backend == saved.backend,
+              latest.username == saved.username, latest.identityReplaced == false,
+              snapshot?.fingerprint == fingerprint else { throw SafetyError.accountMismatch }
+        return latest.core
+    }
+
+    private func publishDeviceAuthority(_ result: CoreResult, accountID: String) throws {
+        guard let data = result.data else { throw SafetyError.invalidResponse }
+        let display = try data.decoded(DeviceAuthoritySnapshot.self).validated(accountID: accountID, origin: serverOrigin)
+        // Save the verified roster/high-water mark before exposing its metadata.
+        try apply(result)
+        deviceAuthority = display
+    }
+
+    private func observeDeviceAuthority(_ saved: StoredAccount, api: API, fingerprint: String) async throws -> Int64 {
+        let remote = try await api.deviceAuthority(token: saved.token)
+        let state = try deviceAuthorizationState(saved, fingerprint: fingerprint)
+        let result = try core.call("device_authority_observe", state: state,
+                                  fields: ["origin": .string(saved.backend), "authority": remote.authority ?? .null,
+                                           "server_time": .integer(remote.server_time)])
+        try publishDeviceAuthority(result, accountID: saved.account_id)
+        return remote.server_time
+    }
+
+    func clearDevicePairingReview() {
+        devicePairingReview = nil
+        devicePairingCode = nil
+    }
+
+    func refreshMessagingDevices() async {
+        await run {
+            clearDevicePairingReview()
+            let (saved, api, fingerprint) = try deviceAuthorizationContext()
+            _ = try await observeDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+        }
+    }
+
+    func prepareMessagingDeviceAuthority() async {
+        await run {
+            clearDevicePairingReview()
+            let (saved, api, fingerprint) = try deviceAuthorizationContext()
+            let now = try await observeDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+            guard deviceAuthority?.pending == nil else { throw SafetyError.deviceAuthorizationConflict }
+            let result = try core.call("device_authority_prepare", state: deviceAuthorizationState(saved, fingerprint: fingerprint),
+                                      fields: ["origin": .string(saved.backend), "server_time": .integer(now)])
+            try publishDeviceAuthority(result, accountID: saved.account_id)
+            try await submitPendingDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+        }
+    }
+
+    func inspectDevicePairing(_ code: String) async {
+        await run {
+            clearDevicePairingReview()
+            try DevicePairingText.validate(code)
+            let (saved, api, fingerprint) = try deviceAuthorizationContext()
+            let now = try await observeDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+            guard deviceAuthority?.pending == nil, let roster = deviceAuthority?.authority?.roster,
+                  roster.devices.count < 2, roster.expires_at > now else { throw SafetyError.deviceAuthorizationConflict }
+            let result = try core.call("device_authority_inspect", state: deviceAuthorizationState(saved, fingerprint: fingerprint),
+                                      fields: ["code": .string(code), "server_time": .integer(now)])
+            guard let data = result.data else { throw SafetyError.invalidResponse }
+            let review = try data.decoded(DeviceLinkInspection.self).validated(accountID: saved.account_id)
+            try apply(result)
+            devicePairingCode = code
+            devicePairingReview = review
+        }
+    }
+
+    func approveReviewedDevice() async {
+        await run {
+            guard let code = devicePairingCode, let reviewed = devicePairingReview else { throw SafetyError.invalidPairingRequest }
+            _ = try reviewed.validated(accountID: snapshot?.account_id ?? "")
+            let (saved, api, fingerprint) = try deviceAuthorizationContext()
+            let now = try await observeDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+            guard deviceAuthority?.pending == nil else { throw SafetyError.deviceAuthorizationConflict }
+            let state = try deviceAuthorizationState(saved, fingerprint: fingerprint)
+            let inspection = try core.call("device_authority_inspect", state: state,
+                                           fields: ["code": .string(code), "server_time": .integer(now)])
+            guard let data = inspection.data,
+                  try data.decoded(DeviceLinkInspection.self).validated(accountID: saved.account_id) == reviewed else {
+                throw SafetyError.invalidPairingRequest
+            }
+            let result = try core.call("device_authority_approve", state: state,
+                                      fields: ["code": .string(code), "expected_request_hash": .string(reviewed.request_hash),
+                                               "server_time": .integer(now)])
+            try publishDeviceAuthority(result, accountID: saved.account_id)
+            clearDevicePairingReview()
+            try await submitPendingDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+        }
+    }
+
+    func revokeMessagingDevice(_ device: DeviceRosterMember) async {
+        await run {
+            clearDevicePairingReview()
+            let (saved, api, fingerprint) = try deviceAuthorizationContext()
+            let now = try await observeDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+            guard device.id != 1, deviceAuthority?.pending == nil,
+                  deviceAuthority?.authority?.roster.devices.contains(where: {
+                      $0.id == device.id && $0.certificate.identity_key == device.certificate.identity_key
+                  }) == true else { throw SafetyError.deviceAuthorizationConflict }
+            let result = try core.call("device_authority_revoke", state: deviceAuthorizationState(saved, fingerprint: fingerprint),
+                                      fields: ["device_id": .integer(Int64(device.id)), "server_time": .integer(now)])
+            try publishDeviceAuthority(result, accountID: saved.account_id)
+            try await submitPendingDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+        }
+    }
+
+    func resumeDeviceAuthorization() async {
+        await run {
+            clearDevicePairingReview()
+            let (saved, api, fingerprint) = try deviceAuthorizationContext()
+            // Observation may reconcile the exact published roster after a lost reply.
+            _ = try await observeDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+            if deviceAuthority?.pending != nil {
+                try await submitPendingDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+            }
+        }
+    }
+
+    private func submitPendingDeviceAuthority(_ saved: StoredAccount, api: API, fingerprint: String) async throws {
+        guard let exactChange = deviceAuthority?.pending else { throw SafetyError.invalidResponse }
+        let login = LoginResponse(token: saved.token, account_id: saved.account_id, username: saved.username, expires_at: saved.expiresAt)
+        let action = try await authorizeAction(login: login, purpose: "device_manage")
+        _ = try deviceAuthorizationState(saved, fingerprint: fingerprint)
+        guard deviceAuthority?.pending == exactChange else { throw SafetyError.deviceAuthorizationConflict }
+        let receipt = try await api.changeDeviceAuthority(exactChange, token: saved.token, actionToken: action.action_token)
+        let receiptJSON = try JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(receipt))
+        let result = try core.call("device_authority_commit", state: deviceAuthorizationState(saved, fingerprint: fingerprint),
+                                  fields: ["receipt": receiptJSON])
+        // Keep approval output hidden until both the receipt is durable and the
+        // current signed roster has been fetched and independently verified.
+        try apply(result)
+        _ = try await observeDeviceAuthority(saved, api: api, fingerprint: fingerprint)
+        alert = "Device authorization saved. Messaging on an approved second device is not yet enabled."
     }
 }

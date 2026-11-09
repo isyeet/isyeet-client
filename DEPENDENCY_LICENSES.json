@@ -3360,13 +3360,13 @@
     },
     {
       "name": "yoke-derive",
-      "version": "0.8.3",
+      "version": "0.8.4",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "license": "Unicode-3.0",
       "notice_files": [
-        "vendor/yoke-derive-0.8.3/LICENSE"
+        "vendor/yoke-derive-0.8.4/LICENSE"
       ],
-      "vendor_checksum_sha256": "0cd8878b83b5075b89ee9e08dd9cf1a236945bba46b98046469562117b685959"
+      "vendor_checksum_sha256": "370bd384c4b970f26d5926e93a09cd84e297365bfe059a82309f54b64da7bef4"
     },
     {
       "name": "zerocopy",

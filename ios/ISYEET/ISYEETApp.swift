@@ -117,8 +117,10 @@ private struct HomeView: View {
     @State private var addingContact = false
     @State private var addingGroup = false
     @State private var choosingAppearance = false
+    @State private var readingManifesto = false
     @State private var confirmingReenrollment = false
     @State private var confirmingLocalDiscard = false
+    @State private var signupUsername = ""
 
     var body: some View {
         NavigationStack(path: $navigationPath) {
@@ -128,13 +130,16 @@ private struct HomeView: View {
                         Label("ISYEET is unavailable", systemImage: "lock")
                     } description: { Text(verbatim: error) } actions: {
                         Button("Retry") { model.retryLoad() }
+                        if model.legacyAccountPresent {
+                            Button("Clear old local account", role: .destructive) { confirmingLocalDiscard = true }
+                        }
                     }
                 } else if let operation = model.pendingAccountOperation {
                     VStack(alignment: .leading, spacing: 18) {
                         Label("Finish saved account operation", systemImage: "lock.shield").font(appearance.font(.title2).bold())
-                        if let email = model.pendingAccountEmail { Text(verbatim: email) }
+                        if let account_id = model.pendingAccountID { Text(verbatim: model.displayName(account_id)) }
                         Text(operation == .delete ? "Account deletion is pending. Messages are paused. Retry this same operation; local keys are erased only after the server confirms deletion." : "Device re-enrollment is pending. The prepared keys are saved securely. Retry this same operation; ISYEET will never generate a second replacement just because a reply was lost.")
-                        Button("Finish with Google") { Task { await model.resumeAccountOperation() } }.disabled(model.busy)
+                        Button("Finish with passkey") { Task { await model.resumeAccountOperation() } }.disabled(model.busy)
                         if model.canCancelAccountOperation {
                             Text("The request expired without changing the original registration. Cancel it to return safely; starting again requires new confirmation.")
                             Button("Cancel expired request") { model.cancelExpiredAccountOperation() }.disabled(model.busy)
@@ -146,11 +151,11 @@ private struct HomeView: View {
                         if model.busy { ProgressView() }
                         LegalLinks()
                     }.padding(24)
-                } else if let email = model.replacedDeviceEmail {
+                } else if let account_id = model.replacedDeviceAccountID {
                     VStack(alignment: .leading, spacing: 18) {
                         Label("DEVICE REGISTRATION MISSING OR CHANGED", systemImage: "exclamationmark.triangle.fill")
                             .font(appearance.font(.title2).bold()).foregroundStyle(appearance.warning)
-                        Text(verbatim: email)
+                        Text(verbatim: model.displayName(account_id))
                         Text("Messaging has stopped because the server registration does not match this device's saved key. Existing history cannot transfer to a new identity. Clear this device only if you intend to sign in or explicitly re-enroll again; contacts must verify any new keys outside ISYEET.")
                         Button("Clear this device's old account data", role: .destructive) { confirmingLocalDiscard = true }.disabled(model.busy)
                         LegalLinks()
@@ -176,7 +181,7 @@ private struct HomeView: View {
                                 .navigationBarTitleDisplayMode(.inline)
                                 .tabItem { Label("Contacts", systemImage: "person.crop.circle") }.tag(HomeTab.contacts)
                             SettingsView(model: model, notifications: notifications, appearanceSelection: $appearanceSelection,
-                                         chooseAppearance: { choosingAppearance = true })
+                                         chooseAppearance: { choosingAppearance = true }, readManifesto: showManifesto)
                                 .navigationTitle("Settings")
                                 .navigationBarTitleDisplayMode(.inline)
                                 .tabItem { Label("Settings", systemImage: "gearshape") }.tag(HomeTab.settings)
@@ -185,32 +190,45 @@ private struct HomeView: View {
                         .toolbarBackground(.visible, for: .tabBar)
                     }
                 } else {
-                    VStack(spacing: 24) {
-                        Text(appearance == .terminal ? "[isyeet]" : "ISYEET")
-                            .font(appearance.font(.largeTitle).bold()).foregroundStyle(appearance.accent)
-                        Text("I Send You E2E Text").font(appearance.font(.title2))
-                        Text(verbatim: model.environmentTitle).font(appearance.font(.subheadline).bold())
-                        if model.isProduction {
-                            Text("Production uses separate keys and contacts. Sign in to enroll here; staging data stays on this device.")
-                                .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
-                        }
-                        Text("Private text. Google sign-in. Nothing else.").foregroundStyle(appearance.secondary)
-                        Button("Continue with Google") { Task { await model.signIn() } }
-                            .buttonStyle(.borderedProminent).disabled(model.busy)
-                            .foregroundStyle(appearance == .terminal ? appearance.background : .white)
-                        if let email = model.reenrollmentEmail {
-                            Text(verbatim: email).font(appearance.font(.footnote))
-                            Button("Re-enroll this device", role: .destructive) { confirmingReenrollment = true }.disabled(model.busy)
-                        }
-                        LegalLinks()
-                        Text("Only printable ASCII. No images, attachments, or formatted messages.")
-                            .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary).multilineTextAlignment(.center)
-                    }.padding(28)
+                    ScrollView {
+                        VStack(spacing: 24) {
+                            Text(appearance == .terminal ? "[isyeet]" : "ISYEET")
+                                .font(appearance.font(.largeTitle).bold()).foregroundStyle(appearance.accent)
+                            Text("I Send You E2E Text").font(appearance.font(.title2))
+                            Text(verbatim: model.environmentTitle).font(appearance.font(.subheadline).bold())
+                            if model.isProduction {
+                                Text("Production uses separate keys and contacts. Sign in to enroll here; staging data stays on this device.")
+                                    .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
+                            }
+                            Text("Private text. Your username. Your passkeys.").foregroundStyle(appearance.secondary)
+                            TextField("Choose a username", text: $signupUsername)
+                                .textContentType(.username).textInputAutocapitalization(.never).autocorrectionDisabled()
+                                .keyboardType(.asciiCapable).textFieldStyle(.roundedBorder)
+                                .accessibilityIdentifier("signupUsername")
+                            Text("3–24 lowercase letters, numbers or underscores. Start with a letter.")
+                                .font(appearance.font(.caption)).foregroundStyle(appearance.secondary)
+                            Button("Create account with passkey") { Task { await model.signIn(username: signupUsername) } }
+                                .buttonStyle(.borderedProminent).disabled(model.busy || (try? MessageSafety.canonicalUsername(signupUsername)) == nil)
+                            Button("Sign in with a passkey") { Task { await model.signIn() } }
+                                .buttonStyle(.borderedProminent).disabled(model.busy)
+                                .foregroundStyle(appearance == .terminal ? appearance.background : .white)
+                            if let account_id = model.reenrollmentAccountID {
+                                Text(verbatim: model.displayName(account_id)).font(appearance.font(.footnote))
+                                Button("Re-enroll this device", role: .destructive) { confirmingReenrollment = true }.disabled(model.busy)
+                            }
+                            Button("Read the manifesto", systemImage: "book.closed", action: showManifesto)
+                                .accessibilityIdentifier("readManifestoButton")
+                            LegalLinks()
+                            Text("Only printable ASCII. No images, attachments, or formatted messages.")
+                                .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary).multilineTextAlignment(.center)
+                        }.frame(maxWidth: .infinity).padding(28)
+                    }
                 }
             }
             .confirmationDialog("Erase this device's saved account data?", isPresented: $confirmingLocalDiscard, titleVisibility: .visible) {
                 Button("Erase local keys and history", role: .destructive) {
-                    if model.pendingAccountOperation != nil { model.discardPendingLocalAccount() }
+                    if model.legacyAccountPresent { model.discardLegacyLocalAccount() }
+                    else if model.pendingAccountOperation != nil { model.discardPendingLocalAccount() }
                     else { model.discardReplacedDevice() }
                 }
                 Button("Cancel", role: .cancel) {}
@@ -257,10 +275,10 @@ private struct HomeView: View {
                 switch route {
                 case .conversation(let id):
                     if id.hasPrefix("group:") { GroupConversationView(model: model, groupID: String(id.dropFirst(6))) }
-                    else { ConversationView(model: model, email: id) }
-                case .contact(let email):
-                    ContactDetailsView(model: model, email: email) {
-                        navigationPath.append(.conversation(email))
+                    else { ConversationView(model: model, account_id: id) }
+                case .contact(let account_id):
+                    ContactDetailsView(model: model, account_id: account_id) {
+                        navigationPath.append(.conversation(account_id))
                     }
                 }
             }
@@ -268,7 +286,7 @@ private struct HomeView: View {
                 navigationPath.removeAll()
                 tab = .messages
                 composeNext = nil; composeStartsGroup = false; composeManagesContacts = false
-                composing = false; addingContact = false; addingGroup = false; choosingAppearance = false
+                composing = false; addingContact = false; addingGroup = false; choosingAppearance = false; readingManifesto = false
             }
             .sheet(isPresented: $composing, onDismiss: {
                 if let route = composeNext { navigationPath.append(route); composeNext = nil }
@@ -288,11 +306,20 @@ private struct HomeView: View {
                 NewGroupView(model: model) { id in navigationPath.append(.conversation("group:" + id)) }
             }
             .sheet(isPresented: $choosingAppearance) { AppearanceView(selection: $appearanceSelection) }
+            .sheet(isPresented: $readingManifesto, onDismiss: { model.setPresentationCovered("manifesto", covered: false) }) {
+                ManifestoView()
+            }
             .onChange(of: composing, initial: true) { _, value in model.setPresentationCovered("compose", covered: value) }
             .onChange(of: addingContact, initial: true) { _, value in model.setPresentationCovered("add-contact", covered: value) }
             .onChange(of: addingGroup, initial: true) { _, value in model.setPresentationCovered("new-group", covered: value) }
             .onChange(of: choosingAppearance, initial: true) { _, value in model.setPresentationCovered("appearance", covered: value) }
+            .onChange(of: readingManifesto, initial: true) { _, value in model.setPresentationCovered("manifesto", covered: value) }
         }
+    }
+
+    private func showManifesto() {
+        model.setPresentationCovered("manifesto", covered: true)
+        readingManifesto = true
     }
 }
 
@@ -337,7 +364,7 @@ private struct InboxView: View {
                     }
                     ForEach(visible) { conversation in
                         NavigationLink(value: HomeRoute.conversation(conversation.id)) {
-                            ConversationSummaryRow(conversation: conversation, accountEmail: model.snapshot?.email ?? "", now: context.date,
+                            ConversationSummaryRow(conversation: conversation, previewSenderName: conversation.previewSender.map(model.displayName), accountID: model.snapshot?.account_id ?? "", now: context.date,
                                                    identityChanged: model.pendingIdentityChanges.contains(conversation.id))
                         }.listRowBackground(appearance.surface)
                     }
@@ -356,7 +383,8 @@ private struct InboxView: View {
 
 private struct ConversationSummaryRow: View {
     let conversation: ConversationSummary
-    let accountEmail: String
+    let previewSenderName: String?
+    let accountID: String
     let now: Date
     let identityChanged: Bool
     @Environment(\.appearance) private var appearance
@@ -396,11 +424,11 @@ private struct ConversationSummaryRow: View {
                 }
                 if let sender = conversation.previewSender {
                     Label {
-                        Text(verbatim: sender == accountEmail ? "You" : (conversation.kind == .group ? sender : "Contact"))
+                        Text(verbatim: sender == accountID ? "You" : (conversation.kind == .group ? previewSenderName ?? "Contact" : "Contact"))
                             .lineLimit(1)
-                    } icon: { Image(systemName: sender == accountEmail ? "arrow.up.right" : "arrow.down.left") }
+                    } icon: { Image(systemName: sender == accountID ? "arrow.up.right" : "arrow.down.left") }
                     .font(appearance.font(.caption2).weight(.medium)).foregroundStyle(appearance.secondary)
-                    .accessibilityLabel(sender == accountEmail ? "Sent by you" : "Received from " + sender)
+                    .accessibilityLabel(sender == accountID ? "Sent by you" : "Received from " + (previewSenderName ?? "contact"))
                 }
                 HStack(alignment: .top, spacing: 8) {
                     Text(verbatim: conversation.preview).font(appearance.font(.subheadline)).foregroundStyle(appearance.secondary)
@@ -434,18 +462,18 @@ private struct ContactListView: View {
             if let snapshot = model.snapshot {
                 if !model.pendingUnverified.isEmpty {
                     Section("Pending messages") {
-                        ForEach(model.pendingUnverified, id: \.self) { email in
-                            if snapshot.contacts.contains(where: { $0.email == email }) {
-                                NavigationLink(value: HomeRoute.contact(email)) {
+                        ForEach(model.pendingUnverified, id: \.self) { account_id in
+                            if snapshot.contacts.contains(where: { $0.account_id == account_id }) {
+                                NavigationLink(value: HomeRoute.contact(account_id)) {
                                     VStack(alignment: .leading, spacing: 4) {
-                                        Text(verbatim: email)
+                                        Text(verbatim: model.displayName(account_id))
                                         Text("Verify to receive queued messages").font(appearance.font(.caption)).foregroundStyle(appearance.warning)
                                     }
                                 }
                             } else {
                                 VStack(alignment: .leading, spacing: 6) {
-                                    Text(verbatim: email)
-                                    Button("Add and verify contact") { Task { await model.addContact(email) } }
+                                    Text(verbatim: model.displayName(account_id))
+                                    Button("Add by username", action: addContact)
                                         .disabled(model.busy || model.needsAuthentication)
                                 }
                             }
@@ -460,26 +488,26 @@ private struct ContactListView: View {
                     }.listRowBackground(appearance.surface)
                 }
                 let contacts = snapshot.contacts.sorted { a, b in
-                    let aNeeds = !a.verified || model.pendingIdentityChanges.contains(a.email)
-                    let bNeeds = !b.verified || model.pendingIdentityChanges.contains(b.email)
-                    return aNeeds != bNeeds ? aNeeds : a.email < b.email
+                    let aNeeds = !a.verified || model.pendingIdentityChanges.contains(a.account_id)
+                    let bNeeds = !b.verified || model.pendingIdentityChanges.contains(b.account_id)
+                    return aNeeds != bNeeds ? aNeeds : a.account_id < b.account_id
                 }
                 Section {
                     if contacts.isEmpty {
                         ContentUnavailableView {
                             Label("Your contacts", systemImage: "person.crop.circle")
                         } description: {
-                            Text("Add a Gmail or Workspace address, then verify their identity to start messaging.")
+                            Text("Add a username, then verify their identity to start messaging.")
                         } actions: { Button("Add contact", action: addContact).disabled(model.busy || model.needsAuthentication) }
                     }
                     ForEach(contacts) { contact in
-                        NavigationLink(value: HomeRoute.contact(contact.email)) {
-                            let changed = model.pendingIdentityChanges.contains(contact.email)
+                        NavigationLink(value: HomeRoute.contact(contact.account_id)) {
+                            let changed = model.pendingIdentityChanges.contains(contact.account_id)
                             HStack(spacing: 12) {
                                 Image(systemName: changed || !contact.verified ? "exclamationmark.shield" : "checkmark.shield")
                                     .foregroundStyle(changed || !contact.verified ? appearance.warning : appearance.accent)
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(verbatim: contact.email).font(appearance.font(.subheadline).weight(.medium))
+                                    Text(verbatim: "@" + contact.username).font(appearance.font(.subheadline).weight(.medium))
                                     Text(changed ? "KEY CHANGED · Remove and re-add" : (contact.verified ? "Verified" : "Verification needed"))
                                         .font(appearance.font(.caption)).foregroundStyle(changed || !contact.verified ? appearance.warning : appearance.secondary)
                                 }
@@ -509,15 +537,15 @@ private struct ComposeView: View {
             List {
                 if let snapshot = model.snapshot {
                     Section {
-                        Button { open(snapshot.email) } label: { Label("Message yourself", systemImage: "arrow.uturn.backward") }
+                        Button { open(snapshot.account_id) } label: { Label("Message yourself", systemImage: "arrow.uturn.backward") }
                         Button(action: newGroup) { Label("New group", systemImage: "person.2") }
                             .disabled(model.busy || model.needsAuthentication || snapshot.groups.count >= 32)
                     }.listRowBackground(appearance.surface)
                     Section("Verified contacts") {
-                        let contacts = snapshot.contacts.filter { $0.verified && !model.pendingIdentityChanges.contains($0.email) }.sorted { $0.email < $1.email }
+                        let contacts = snapshot.contacts.filter { $0.verified && !model.pendingIdentityChanges.contains($0.account_id) }.sorted { $0.account_id < $1.account_id }
                         if contacts.isEmpty { Text("Add and verify a contact to start a conversation.").foregroundStyle(appearance.secondary) }
                         ForEach(contacts) { contact in
-                            Button { open(contact.email) } label: { Text(verbatim: contact.email).foregroundStyle(appearance.primary) }
+                            Button { open(contact.account_id) } label: { Text(verbatim: "@" + contact.username).foregroundStyle(appearance.primary) }
                         }
                         Button("Manage contacts", action: manageContacts)
                     }.listRowBackground(appearance.surface)
@@ -543,6 +571,7 @@ private struct SettingsView: View {
     @ObservedObject var notifications: PushNotifications
     @Binding var appearanceSelection: String
     let chooseAppearance: () -> Void
+    let readManifesto: () -> Void
     @State private var deletingAccount = false
     @State private var legalDocument: BundledLegalDocument?
     @Environment(\.appearance) private var appearance
@@ -564,7 +593,16 @@ private struct SettingsView: View {
                         .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
                 }.listRowBackground(appearance.surface)
                 Section("Your account") {
-                    Text(verbatim: snapshot.email)
+                    Text(verbatim: "@" + snapshot.username)
+                    LabeledContent("Account ID", value: snapshot.account_id).font(appearance.font(.caption))
+                    NavigationLink { PasskeySettingsView(model: model) } label: { Label("Passkeys", systemImage: "person.badge.key") }
+                    if model.experimentalDeviceAuthorizationAvailable {
+                        NavigationLink { MessagingDevicesView(model: model) } label: { Label("Messaging Devices", systemImage: "desktopcomputer.and.iphone") }
+                    }
+                    DisclosureGroup("Messaging device") {
+                        Text("This phone is the account’s only active messaging device. Synced or additional passkeys let you sign in; they do not copy encryption keys or message history. Desktop device linking is not available yet.")
+                            .font(appearance.font(.footnote))
+                    }
                     Button("Delete account", role: .destructive) {
                         model.setPresentationCovered("account-action", covered: true)
                         deletingAccount = true
@@ -582,6 +620,17 @@ private struct SettingsView: View {
                             Text(verbatim: appearance.title).foregroundStyle(appearance.secondary)
                         }
                     }.accessibilityIdentifier("appearanceButton")
+                }.listRowBackground(appearance.surface)
+                Section("The idea") {
+                    Button(action: readManifesto) {
+                        Label {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Read the manifesto")
+                                Text("All I want is text.")
+                                    .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
+                            }
+                        } icon: { Image(systemName: "book.closed") }
+                    }.accessibilityIdentifier("readManifestoButton")
                 }.listRowBackground(appearance.surface)
                 Section("Traffic mode") {
                     Picker("Mode", selection: Binding(get: { model.trafficMode }, set: { mode in Task { await model.setTrafficMode(mode) } })) {
@@ -681,9 +730,14 @@ private struct DeleteAccountView: View {
                 Section {
                     Label("Delete your ISYEET account", systemImage: "exclamationmark.triangle.fill")
                         .font(appearance.font(.title2).bold()).foregroundStyle(appearance.warning)
-                    if let email = model.snapshot?.email { Text(verbatim: email) }
+                    if let account_id = model.snapshot?.account_id { Text(verbatim: model.displayName(account_id)) }
                     Text("This removes your live server registration and queued messages, then erases this device's encryption keys, contacts and history. Cloudflare recovery history may retain copies for up to 30 days. Copies already held by other people cannot be erased. This cannot be undone.")
-                    Text("A fresh Google sign-in is required. If interrupted, ISYEET saves this deletion operation and lets you finish it safely.")
+                    Text("Fresh passkey verification is required. If interrupted, ISYEET saves this deletion operation and lets you finish it safely.")
+                    NavigationLink { PasskeySettingsView(model: model) } label: { Label("Passkeys", systemImage: "person.badge.key") }
+                    DisclosureGroup("Messaging device") {
+                        Text("This phone is the account’s only active messaging device. Synced or additional passkeys let you sign in; they do not copy encryption keys or message history. Desktop device linking is not available yet.")
+                            .font(appearance.font(.footnote))
+                    }
                     Button("Delete account", role: .destructive) { confirming = true }.disabled(model.busy)
                 }.listRowBackground(appearance.surface)
                 Section { LegalLinks() }.listRowBackground(appearance.surface)
@@ -692,7 +746,7 @@ private struct DeleteAccountView: View {
                 .navigationTitle("Delete account").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() }.disabled(model.busy) } }
                 .confirmationDialog("Permanently delete this account?", isPresented: $confirming, titleVisibility: .visible) {
-                    Button("Continue to Google and delete", role: .destructive) { Task { await model.beginAccountDeletion() } }
+                    Button("Verify passkey and delete", role: .destructive) { Task { await model.beginAccountDeletion() } }
                     Button("Cancel", role: .cancel) {}
                 } message: { Text("After server confirmation, this device's keys and history are erased. There is no recovery.") }
         }.interactiveDismissDisabled(model.busy)
@@ -703,25 +757,25 @@ private struct AddContactView: View {
     @ObservedObject var model: AppModel
     @Environment(\.appearance) private var appearance
     @Environment(\.dismiss) private var dismiss
-    @State private var email = ""
+    @State private var account_id = ""
 
     var body: some View {
         NavigationStack {
             Form {
-                TextField("Gmail or Workspace address", text: $email,
-                          prompt: Text("Gmail or Workspace address").foregroundStyle(appearance.secondary))
-                    .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
+                TextField("Username", text: $account_id,
+                          prompt: Text("Username").foregroundStyle(appearance.secondary))
+                    .keyboardType(.asciiCapable).textInputAutocapitalization(.never).autocorrectionDisabled()
                     .listRowBackground(appearance.surface)
                 Text("After adding the contact, verify their identity fingerprint through a trusted channel before exchanging text.")
                     .font(appearance.font(.footnote))
                     .listRowBackground(appearance.surface)
                 Button("Add contact") {
                     Task {
-                        await model.addContact(email)
-                        if let canonical = try? MessageSafety.canonicalEmail(email),
-                           model.snapshot?.contacts.contains(where: { $0.email == canonical }) == true { dismiss() }
+                        await model.addContact(account_id)
+                        if let canonical = try? MessageSafety.canonicalUsername(account_id.hasPrefix("@") ? String(account_id.dropFirst()) : account_id),
+                           model.snapshot?.contacts.contains(where: { $0.username == canonical }) == true { dismiss() }
                     }
-                }.disabled(model.busy || email.isEmpty)
+                }.disabled(model.busy || account_id.isEmpty)
                     .listRowBackground(appearance.surface)
             }
             .font(appearance.font(.body))
@@ -745,7 +799,7 @@ private struct NewGroupView: View {
     @State private var members = Set<String>()
 
     private var eligible: [Contact] {
-        model.snapshot?.contacts.filter { $0.verified && !model.pendingIdentityChanges.contains($0.email) } ?? []
+        model.snapshot?.contacts.filter { $0.verified && !model.pendingIdentityChanges.contains($0.account_id) } ?? []
     }
     private var valid: Bool { (try? MessageGroup.validateTitle(title)) != nil && (1...7).contains(members.count) }
 
@@ -762,10 +816,10 @@ private struct NewGroupView: View {
                 Section("Choose 1–7 contacts") {
                     if eligible.isEmpty { Text("Add and independently verify contacts first.") }
                     ForEach(eligible) { contact in
-                        Toggle(isOn: Binding(get: { members.contains(contact.email) }, set: { selected in
-                            if selected { members.insert(contact.email) } else { members.remove(contact.email) }
-                        })) { Text(verbatim: contact.email) }
-                        .disabled(!members.contains(contact.email) && members.count >= 7)
+                        Toggle(isOn: Binding(get: { members.contains(contact.account_id) }, set: { selected in
+                            if selected { members.insert(contact.account_id) } else { members.remove(contact.account_id) }
+                        })) { Text(verbatim: "@" + contact.username) }
+                        .disabled(!members.contains(contact.account_id) && members.count >= 7)
                     }
                 }.listRowBackground(appearance.surface)
                 Section {
@@ -786,5 +840,173 @@ private struct NewGroupView: View {
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() }.disabled(model.busy) } }
             .interactiveDismissDisabled(model.busy)
         }
+    }
+}
+
+
+private struct PasskeySettingsView: View {
+    @ObservedObject var model: AppModel
+    @State private var label = ""
+    @State private var securityKey = false
+    @State private var removing: RegisteredPasskey?
+    @Environment(\.appearance) private var appearance
+
+    var body: some View {
+        Form {
+            Section {
+                Text("A passkey signs you in. Your messaging keys stay on this phone.")
+                Text("iCloud Keychain may share one passkey across your iPhone and Mac. Add a different password manager or hardware security key for an independent backup. If every passkey is lost, ISYEET cannot recover the account.")
+                    .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
+            }.listRowBackground(appearance.surface)
+            Section("Registered passkeys") {
+                ForEach(model.passkeys) { key in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(verbatim: key.label)
+                        Text("Added " + Date(timeIntervalSince1970: Double(key.created_at)).formatted(date: .abbreviated, time: .omitted))
+                            .font(appearance.font(.caption)).foregroundStyle(appearance.secondary)
+                        Button("Remove", role: .destructive) { removing = key }
+                            .disabled(model.busy || model.needsAuthentication || model.passkeys.count <= 1)
+                    }
+                }
+                if model.passkeys.isEmpty { Text("Sign in and refresh to see registered passkeys.") }
+            }.listRowBackground(appearance.surface)
+            Section("Add a passkey") {
+                TextField("Name, e.g. Backup security key", text: $label)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.asciiCapable)
+                Toggle("Hardware security key", isOn: $securityKey)
+                Button("Verify existing passkey and add") {
+                    Task { await model.addPasskey(label: label, securityKey: securityKey) }
+                }.disabled(model.busy || model.needsAuthentication || model.passkeys.count >= 8 || label.isEmpty)
+                Text("First verify with an existing passkey, then save the new one. Keep at least one independent backup. Up to eight credentials per account.")
+                    .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
+            }.listRowBackground(appearance.surface)
+        }
+        .scrollContentBackground(.hidden).background(appearance.background)
+        .navigationTitle("Passkeys").navigationBarTitleDisplayMode(.inline)
+        .task { model.setPresentationCovered("passkeys", covered: true); await model.refreshPasskeys() }
+        .onDisappear { model.setPresentationCovered("passkeys", covered: false) }
+        .refreshable { await model.refreshPasskeys() }
+        .confirmationDialog("Remove this passkey?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible) {
+            if let key = removing {
+                Button("Remove passkey", role: .destructive) { removing = nil; Task { await model.removePasskey(key) } }
+            }
+            Button("Cancel", role: .cancel) { removing = nil }
+        } message: {
+            Text("Verify using a different registered passkey. This invalidates every synced copy of the removed credential and signs out current sessions. Your phone’s messaging keys remain saved.")
+        }
+    }
+}
+
+private struct MessagingDevicesView: View {
+    @ObservedObject var model: AppModel
+    @State private var request = ""
+    @State private var compared = false
+    @State private var removing: DeviceRosterMember?
+    @Environment(\.appearance) private var appearance
+
+    private var unavailable: Bool { model.busy || model.needsAuthentication || !model.experimentalDeviceAuthorizationAvailable }
+
+    var body: some View {
+        Form {
+            Section {
+                Text("Development preview: device approval only")
+                Text("An approved second device cannot send or receive messages yet. No message history or private messaging keys are shared. This phone remains your only messaging device.")
+                    .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
+            }.listRowBackground(appearance.surface)
+            if let current = model.deviceAuthority {
+                if let signed = current.authority {
+                    Section("Authorized devices") {
+                        ForEach(signed.roster.devices) { device in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(verbatim: device.certificate.label)
+                                Text(device.id == 1 ? "Primary phone" : "Device approved; messaging not yet enabled")
+                                    .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
+                                if device.id != 1 {
+                                    Button("Remove approval", role: .destructive) { removing = device }
+                                        .disabled(unavailable || current.pending != nil)
+                                }
+                            }
+                        }
+                        Text("Up to two devices. Approval list expires " + Date(timeIntervalSince1970: Double(signed.roster.expires_at)).formatted(date: .abbreviated, time: .shortened) + ".")
+                            .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
+                        Button("Verify passkey and renew list") { Task { await model.prepareMessagingDeviceAuthority() } }
+                            .disabled(unavailable || current.pending != nil)
+                    }.listRowBackground(appearance.surface)
+                } else {
+                    Section("Primary phone") {
+                        Text("Create a signed device list using this phone’s existing Signal identity and your passkey.")
+                        Button("Verify passkey and create list") { Task { await model.prepareMessagingDeviceAuthority() } }
+                            .disabled(unavailable || current.pending != nil)
+                    }.listRowBackground(appearance.surface)
+                }
+                if current.pending != nil {
+                    Section("Pending authorization") {
+                        Text("The exact signed change is saved. Refresh checks whether it already completed before retrying. An expired change is discarded only after the previous device list is confirmed.")
+                            .font(appearance.font(.footnote))
+                        Button("Check and finish saved change") { Task { await model.resumeDeviceAuthorization() } }
+                            .disabled(unavailable)
+                    }.listRowBackground(appearance.surface)
+                }
+                if let approval = current.approval_code, let roster = current.authority?.roster,
+                   roster.expires_at > Int64(Date().timeIntervalSince1970) {
+                    Section("Approval response") {
+                        Text("Device approved; messaging not yet enabled")
+                        Text("Copy this entire public approval response back to the requesting device. It contains no private keys or history.")
+                            .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
+                        Text(verbatim: approval).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                    }.listRowBackground(appearance.surface)
+                }
+                if let roster = current.authority?.roster, roster.devices.count < 2, current.pending == nil {
+                    pairingSection
+                }
+            } else {
+                Section {
+                    Text("Refresh to verify the current device list.")
+                    Button("Refresh devices") { Task { await model.refreshMessagingDevices() } }.disabled(unavailable)
+                }.listRowBackground(appearance.surface)
+            }
+        }
+        .scrollContentBackground(.hidden).background(appearance.background)
+        .navigationTitle("Messaging Devices").navigationBarTitleDisplayMode(.inline)
+        .task { model.setPresentationCovered("messaging-devices", covered: true); await model.refreshMessagingDevices() }
+        .onDisappear { model.setPresentationCovered("messaging-devices", covered: false); model.clearDevicePairingReview() }
+        .onChange(of: model.devicePairingReview) { _, _ in compared = false }
+        .refreshable { await model.refreshMessagingDevices() }
+        .confirmationDialog("Remove this device’s approval?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible) {
+            if let device = removing {
+                Button("Verify passkey and remove", role: .destructive) { removing = nil; Task { await model.revokeMessagingDevice(device) } }
+            }
+            Button("Cancel", role: .cancel) { removing = nil }
+        } message: {
+            Text("This signs a new device list without that device. Your primary phone and passkeys remain unchanged. Second-device messaging is not enabled in this preview.")
+        }
+    }
+
+    private var pairingSection: some View {
+        Section("Review a second device") {
+            Text("Paste the complete ISYEET-LINK-1 request from your other device. Requests expire after five minutes. Never approve a request sent by another person.")
+                .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
+            TextField("Complete pairing request", text: $request, axis: .vertical)
+                .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.asciiCapable)
+                .lineLimit(2...5).font(.system(.caption, design: .monospaced))
+                .onChange(of: request) { _, _ in model.clearDevicePairingReview(); compared = false }
+            Button("Review request") { Task { await model.inspectDevicePairing(request) } }
+                .disabled(unavailable || (try? DevicePairingText.validate(request)) == nil)
+            if let review = model.devicePairingReview {
+                LabeledContent("Account", value: model.displayName(review.account_id))
+                Text(verbatim: review.account_id).font(.system(.caption, design: .monospaced))
+                Text(verbatim: model.serverOrigin).font(appearance.font(.footnote))
+                Text(verbatim: review.label)
+                Text("Device key fingerprint").font(appearance.font(.caption))
+                Text(verbatim: review.identity_fingerprint).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                Text("Request comparison fingerprint").font(appearance.font(.caption))
+                Text(verbatim: review.request_hash).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                Text("Compare both complete fingerprints with those shown on your other device. A matching device name is not proof of identity.")
+                    .font(appearance.font(.footnote)).foregroundStyle(appearance.secondary)
+                Toggle("Both fingerprints match my other device", isOn: $compared)
+                Button("Verify passkey and approve device") { Task { await model.approveReviewedDevice() } }
+                    .disabled(unavailable || !compared)
+            }
+        }.listRowBackground(appearance.surface)
     }
 }

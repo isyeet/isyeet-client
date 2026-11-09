@@ -7,7 +7,7 @@ const MAX_REMOVED: usize = 256;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct RemovedContact {
-    email: String,
+    account_id: String,
     fingerprint: String,
     expires_at: i64,
     unsafe_identity: bool,
@@ -16,10 +16,14 @@ pub(super) struct RemovedContact {
 impl State {
     /// Persist before synchronizing the reduced relay allowlist. Already released
     /// ciphertext cannot be recalled by a local state transition.
-    pub fn remove_contact(&mut self, email: &str, previous_fingerprint: &str) -> Result<Value> {
+    pub fn remove_contact(
+        &mut self,
+        account_id: &str,
+        previous_fingerprint: &str,
+    ) -> Result<Value> {
         let removal = (|| {
-            let target = normalized(email)?;
-            ensure!(target == email && target != self.email);
+            let target = normalized(account_id)?;
+            ensure!(target == account_id && target != self.account_id);
             let key = self
                 .identities
                 .known
@@ -43,6 +47,7 @@ impl State {
             }
             proposed.sessions.0.remove(&target);
             proposed.identities.known.remove(&target);
+            proposed.contact_usernames.remove(&target);
             proposed.verified.remove(&target);
             proposed
                 .outbox
@@ -55,7 +60,7 @@ impl State {
             // Own account prekeys and consumed-key replay markers are shared
             // across contacts and must not be reset when one peer is removed.
             proposed.removed_contacts.push(RemovedContact {
-                email: target.clone(),
+                account_id: target.clone(),
                 fingerprint: pin,
                 expires_at: deadline(proposed.last_observed_at)?
                     .checked_add(MESSAGE_FUTURE_SKEW_SECONDS)
@@ -65,25 +70,27 @@ impl State {
             proposed
                 .resolved_message_ids
                 .retain(|id| proposed.messages.iter().any(|message| &message.id == id));
-            Ok::<_, anyhow::Error>((proposed, json!({"email":target,"removed":true})))
+            Ok::<_, anyhow::Error>((proposed, json!({"account_id":target,"removed":true})))
         })()
         .map_err(|_| anyhow::anyhow!(REMOVAL_REJECTED))?;
         *self = removal.0;
         Ok(removal.1)
     }
 
-    pub(super) fn removed_pin(&self, email: &str, pin: &str) -> bool {
+    pub(super) fn removed_pin(&self, account_id: &str, pin: &str) -> bool {
         self.removed_contacts.iter().any(|removed| {
-            removed.unsafe_identity && removed.email == email && removed.fingerprint == pin
+            removed.unsafe_identity
+                && removed.account_id == account_id
+                && removed.fingerprint == pin
         })
     }
 
     pub(super) fn removed_delivery(&self, sender: &str, envelope: &str) -> bool {
-        if sender == self.email
+        if sender == self.account_id
             || !self
                 .removed_contacts
                 .iter()
-                .any(|removed| removed.email == sender)
+                .any(|removed| removed.account_id == sender)
         {
             return false;
         }
@@ -116,7 +123,7 @@ impl State {
                 && self
                     .removed_contacts
                     .iter()
-                    .any(|removed| removed.email == sender && removed.fingerprint == pin)
+                    .any(|removed| removed.account_id == sender && removed.fingerprint == pin)
         })
     }
 
@@ -129,17 +136,16 @@ impl State {
             .retain(|removed| removed.expires_at > current || removed.unsafe_identity);
         // Active warnings and blocked rosters remain; absent expired tombstones
         // do not grow indefinitely as the user cycles through contacts.
-        self.group_identity_warnings.retain(|email, pin| {
-            self.identities.known.contains_key(email)
+        self.group_identity_warnings.retain(|account_id, pin| {
+            self.identities.known.contains_key(account_id)
                 || self
                     .removed_contacts
                     .iter()
-                    .any(|removed| &removed.email == email && &removed.fingerprint == pin)
+                    .any(|removed| &removed.account_id == account_id && &removed.fingerprint == pin)
                 || self.groups.values().any(|group| {
-                    group
-                        .members
-                        .iter()
-                        .any(|member| &member.email == email && &member.fingerprint == pin)
+                    group.members.iter().any(|member| {
+                        &member.account_id == account_id && &member.fingerprint == pin
+                    })
                 })
         });
         before
@@ -149,18 +155,18 @@ impl State {
             )
     }
 
-    pub(super) fn verified_readded_contact(&mut self, email: &str, pin: &str) {
+    pub(super) fn verified_readded_contact(&mut self, account_id: &str, pin: &str) {
         for removed in &mut self.removed_contacts {
-            if removed.email == email && removed.fingerprint != pin {
+            if removed.account_id == account_id && removed.fingerprint != pin {
                 removed.unsafe_identity = false;
             }
         }
         if self
             .group_identity_warnings
-            .get(email)
+            .get(account_id)
             .is_some_and(|old| old != pin)
         {
-            self.group_identity_warnings.remove(email);
+            self.group_identity_warnings.remove(account_id);
         }
         self.prune_removed_contacts(self.last_observed_at);
     }

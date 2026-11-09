@@ -1,7 +1,7 @@
 use super::*;
 use crate::tests::{bundle, incoming, restart};
-async fn initialized(email: &str) -> Result<State> {
-    let mut state = State::initialize(email).await?;
+async fn initialized(account_id: &str) -> Result<State> {
+    let mut state = State::initialize(account_id, &format!("u{}", &account_id[..8])).await?;
     state.confirm_initial_upload()?;
     Ok(state)
 }
@@ -24,7 +24,9 @@ fn serialized(state: &State) -> Vec<u8> {
 #[test]
 fn topup_is_durable_exact_retry_and_confirmation_is_atomic() {
     futures::executor::block_on(async {
-        let mut state = initialized("alice@gmail.com").await.unwrap();
+        let mut state = initialized("0beaac69-d53e-48d2-b5aa-dd405b7f414d")
+            .await
+            .unwrap();
         let now = current_time().unwrap();
         let original_identity = state.upload.identity_key.clone();
         let mut remote = inventory(&state, 0);
@@ -103,17 +105,24 @@ fn topup_is_durable_exact_retry_and_confirmation_is_atomic() {
 #[test]
 fn rotate_retains_old_setup_for_thirty_day_session_and_seven_day_queue() {
     futures::executor::block_on(async {
-        let mut bob = initialized("bob@gmail.com").await.unwrap();
-        let mut alice = initialized("alice@gmail.com").await.unwrap();
+        let mut bob = initialized("300db02d-b75a-4922-8759-f08a0efa5a40")
+            .await
+            .unwrap();
+        let mut alice = initialized("0beaac69-d53e-48d2-b5aa-dd405b7f414d")
+            .await
+            .unwrap();
         let now = current_time().unwrap();
         // Alice obtains Bob's prior epoch immediately before it is replaced.
         alice.add_contact(bundle(&bob)).await.unwrap();
         alice
-            .verify_contact(&bob.email, &fingerprint(&bob.upload.identity_key).unwrap())
+            .verify_contact(
+                &bob.account_id,
+                &fingerprint(&bob.upload.identity_key).unwrap(),
+            )
             .unwrap();
         bob.add_contact(bundle(&alice)).await.unwrap();
         bob.verify_contact(
-            &alice.email,
+            &alice.account_id,
             &fingerprint(&alice.upload.identity_key).unwrap(),
         )
         .unwrap();
@@ -134,7 +143,7 @@ fn rotate_retains_old_setup_for_thirty_day_session_and_seven_day_queue() {
         // Still a genuine Signal message under the old signed/KEM/EC keys.
         let sent_at = now + 29 * 86400;
         let message = alice
-            .encrypt_at(&bob.email, "late setup", sent_at)
+            .encrypt_at(&bob.account_id, "late setup", sent_at)
             .await
             .unwrap();
         let received = bob
@@ -153,14 +162,16 @@ fn rotate_retains_old_setup_for_thirty_day_session_and_seven_day_queue() {
         assert!(!bob.kyber.records.contains_key(&1));
         assert!(bob.kyber.used.iter().all(|entry| !entry.starts_with("1:")));
         assert_eq!(bob.upload.identity_key, request.keys.identity_key);
-        assert!(bob.identities.known.contains_key(&alice.email));
+        assert!(bob.identities.known.contains_key(&alice.account_id));
     });
 }
 
 #[test]
 fn fresh_rotated_bundle_real_signal_roundtrip_and_no_identity_change() {
     futures::executor::block_on(async {
-        let mut bob = initialized("bob@gmail.com").await.unwrap();
+        let mut bob = initialized("300db02d-b75a-4922-8759-f08a0efa5a40")
+            .await
+            .unwrap();
         let now = current_time().unwrap();
         let pair = bob.identities.pair.clone();
         bob.key_maintenance.rotated_at = 0;
@@ -173,9 +184,11 @@ fn fresh_rotated_bundle_real_signal_roundtrip_and_no_identity_change() {
             .unwrap();
         bob.confirm_key_maintenance_at(receipt(&request), now)
             .unwrap();
-        let mut carol = initialized("carol@gmail.com").await.unwrap();
+        let mut carol = initialized("c36e0493-49f8-4439-aa4c-2aa333bf235f")
+            .await
+            .unwrap();
         crate::tests::connect(&mut carol, &mut bob).await;
-        let outgoing = carol.encrypt(&bob.email, "new epoch").await.unwrap();
+        let outgoing = carol.encrypt(&bob.account_id, "new epoch").await.unwrap();
         assert_eq!(
             bob.decrypt(incoming(&carol, outgoing))
                 .await
@@ -184,7 +197,7 @@ fn fresh_rotated_bundle_real_signal_roundtrip_and_no_identity_change() {
                 .as_deref(),
             Some("new epoch")
         );
-        let reply = bob.encrypt(&carol.email, "reply").await.unwrap();
+        let reply = bob.encrypt(&carol.account_id, "reply").await.unwrap();
         assert_eq!(
             carol
                 .decrypt(incoming(&bob, reply))
@@ -201,7 +214,9 @@ fn fresh_rotated_bundle_real_signal_roundtrip_and_no_identity_change() {
 #[test]
 fn invalid_inventory_and_capacity_fail_without_mutation() {
     futures::executor::block_on(async {
-        let mut state = initialized("alice@gmail.com").await.unwrap();
+        let mut state = initialized("0beaac69-d53e-48d2-b5aa-dd405b7f414d")
+            .await
+            .unwrap();
         state.expire().unwrap();
         let now = current_time().unwrap();
         let good = inventory(&state, 0);
@@ -242,7 +257,9 @@ fn invalid_inventory_and_capacity_fail_without_mutation() {
 #[test]
 fn claimed_prekeys_retire_once_and_ids_never_reused() {
     futures::executor::block_on(async {
-        let mut state = initialized("alice@gmail.com").await.unwrap();
+        let mut state = initialized("0beaac69-d53e-48d2-b5aa-dd405b7f414d")
+            .await
+            .unwrap();
         let now = current_time().unwrap();
         let mut remote = inventory(&state, 0);
         remote.keys.pre_keys.remove(0);
@@ -275,39 +292,27 @@ fn claimed_prekeys_retire_once_and_ids_never_reused() {
 }
 
 #[test]
-fn v5_migration_rotates_immediately_preserving_identity_and_downgrade_guard() {
+fn pre_username_key_maintenance_state_requires_explicit_new_enrollment() {
     futures::executor::block_on(async {
-        let original = initialized("alice@gmail.com").await.unwrap();
-        let identity = original.identities.pair.clone();
+        let original = initialized("0beaac69-d53e-48d2-b5aa-dd405b7f414d")
+            .await
+            .unwrap();
         let mut value = serde_json::to_value(&original).unwrap();
         value["version"] = json!(5);
         value.as_object_mut().unwrap().remove("key_maintenance");
         let mut state: State = serde_json::from_value(value).unwrap();
-        state.expire().unwrap();
-        assert_eq!(state.version, 6);
-        let remote = inventory(&state, 0);
-        let request = state
-            .prepare_key_maintenance(remote)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(request.keys.signed_pre_key.id, 1);
-        assert_eq!(state.identities.pair, identity);
-        let response = dispatch(
-            json!({"op":"confirm_key_maintenance","state":state,"receipt":receipt(&request)}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response["ok"], true);
-        assert!(response["data"]["key_maintenance"]["pending"].is_null());
-        assert_eq!(response["state"]["version"], 6);
+        let before = serde_json::to_value(&state).unwrap();
+        assert!(state.expire().is_err());
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
     });
 }
 
 #[test]
 fn fresh_login_accepts_only_known_current_or_journaled_keys_and_initial_flag_is_explicit() {
     futures::executor::block_on(async {
-        let mut state = State::initialize("alice@gmail.com").await.unwrap();
+        let mut state = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
         assert!(state.initial_upload_pending());
         let before = serialized(&state);
         assert!(

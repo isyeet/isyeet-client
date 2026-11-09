@@ -31,30 +31,15 @@
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleURLName</key>
-			<string>Google OAuth</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>$(ISYEET_CALLBACK_SCHEME)</string>
-			</array>
-		</dict>
-	</array>
 	<key>ISYEETEnvironment</key>
 	<string>$(ISYEET_ENVIRONMENT)</string>
 	<key>ISYEETServerURL</key>
 	<string>$(ISYEET_SERVER_URL)</string>
-	<key>ISYEETGoogleClientID</key>
-	<string>$(ISYEET_GOOGLE_CLIENT_ID)</string>
-	<key>ISYEETCallbackScheme</key>
-	<string>$(ISYEET_CALLBACK_SCHEME)</string>
 	<key>ISYEETAllowLoopbackHTTP</key>
 	<string>$(ISYEET_ALLOW_LOOPBACK_HTTP)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
-	<!-- Apple questionnaire: bundled standard encryption, no France distribution.
-	     Owner-approved private internal TestFlight scope; see TESTFLIGHT.md. -->
 	<false/>
+	<key>ISYEETPasskeyRelyingParty</key>
+	<string>$(ISYEET_PASSKEY_RP)</string>
 </dict>
 </plist>

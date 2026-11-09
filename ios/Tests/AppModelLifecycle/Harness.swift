@@ -1,3 +1,19 @@
+func testUsername(_ id: String) -> String {
+    switch id {
+    case "81d1a713-5b97-4257-bfb4-f094a2004296": "me_test"
+    case "0beaac69-d53e-48d2-b5aa-dd405b7f414d": "alice"
+    case "300db02d-b75a-4922-8759-f08a0efa5a40": "bob"
+    case "c36e0493-49f8-4439-aa4c-2aa333bf235f": "carol"
+    case "781e65af-8b81-4d42-9fef-a6bc1253f62f": "dave"
+    case "9fa56b84-e436-4423-8452-b98816524ec5": "outsider"
+    case "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130": "other"
+    case "ee9c5bcd-53b5-4939-b07a-8e021c7b6cfc": "elsewhere"
+    case "5ff860bf-1190-496c-b188-ab851db691f0": "bob"
+    case "75f4499b-5920-4d38-b057-e967e297590a": "a_test"
+    default: "test_user"
+    }
+}
+
 import Foundation
 
 // Standalone regression harness compiled with the real Domain and AppModel.
@@ -15,7 +31,7 @@ import Foundation
     static var failOperationSave = false
     static var failClearAccount = false
     static var failClearOperation = false
-    static var authEmail: String?
+    static var authAccountID: String?
     static var registrationExists = false
     static var remoteFingerprint: String? = String(repeating: "a", count: 64)
     static var operationRequests: [AccountOperation] = []
@@ -32,6 +48,19 @@ import Foundation
     static var operationServerTime: Int64?
     static var remoteGeneration = "00000000-0000-4000-8000-000000000010"
     static var loginCalls = 0
+    static var deviceAuthorityCalls = 0
+    static var deviceNetworkEnabled = false
+    static var deviceRemoteAuthority: JSONValue?
+    static var deviceMutationCalls: [JSONValue] = []
+    static var deviceProofs = 0
+    static var deviceLoseReceipt = false
+    static var deviceRejectMutation = false
+    static var devicePendingExpired = false
+    static func resetDeviceAuthorization() {
+        deviceAuthorityCalls = 0; deviceNetworkEnabled = true; deviceRemoteAuthority = nil
+        deviceMutationCalls = []; deviceProofs = 0; deviceLoseReceipt = false
+        deviceRejectMutation = false; devicePendingExpired = false
+    }
     static var uploads = 0
     static var failUpload = false
     static var pushUpdates = 0
@@ -94,7 +123,7 @@ import Foundation
     static func reset(_ messages: [StoredMessage], outbox: [SendRequest] = [], sessionValid: Bool = false, contacts: [Contact] = [], groups: [MessageGroup] = [], refs: [OutboxReference] = [], traffic: TrafficState = TrafficState()) throws {
         serverURL = URL(string: "https://example.com")!; accounts = [:]; operations = [:]
         operation = nil; failOperationSave = false; failClearAccount = false; failClearOperation = false
-        authEmail = nil; registrationExists = false; remoteFingerprint = String(repeating: "a", count: 64)
+        authAccountID = nil; registrationExists = false; remoteFingerprint = String(repeating: "a", count: 64)
         operationRequests = []; failRemoteOperation = false; holdAccountOperation = false; heldAccountOperation = nil
         mismatchOwnKeys = false; failOwnKeys = false; mismatchSignedKeys = false; failReceiptSave = false; holdPermissions = false; heldPermissions = nil
         conflictOperation = false; remoteAbsent = false; missingOwnKeys = false; operationServerTime = nil
@@ -106,8 +135,8 @@ import Foundation
         selfMessages = false; failSend = false; rejectSelfReturn = false; holdInbox = false; heldInbox = nil; keyClaims = 0
         failedRecipients = []; allowResolve = false; deferredArrival = nil; directArrival = nil; resolutionGroup = nil
         remoteCover = false; failMode = false; modeCalls = []; coverArrives = false; holdMode = false; heldMode = nil; policyReads = 0; confirmations = 0; serverTimeOffset = 0
-        let snapshot = Snapshot(email: "me@gmail.com", fingerprint: String(repeating: "a", count: 64), contacts: contacts, outbox: outbox, messages: messages, groups: groups, outbox_refs: refs, traffic: traffic)
-        saved = StoredAccount(version: 1, backend: "https://example.com", email: snapshot.email,
+        let snapshot = Snapshot(account_id: "81d1a713-5b97-4257-bfb4-f094a2004296", username: testUsername("81d1a713-5b97-4257-bfb4-f094a2004296"), fingerprint: String(repeating: "a", count: 64), contacts: contacts, outbox: outbox, messages: messages, groups: groups, outbox_refs: refs, traffic: traffic)
+        saved = StoredAccount(version: 2, backend: "https://example.com", account_id: snapshot.account_id, username: testUsername(snapshot.account_id),
                               token: "synthetic", expiresAt: sessionValid ? Int64.max : 1,
                               core: .object(["snapshot": try json(snapshot), "identity": .string("unchanged synthetic key marker")]),
                               registered: true, unreadMessageIDs: messages.map(\.id))
@@ -128,7 +157,7 @@ import Foundation
     static func updated(_ original: Snapshot, messages: [StoredMessage]? = nil, outbox: [SendRequest]? = nil,
                         groups: [MessageGroup]? = nil, refs: [OutboxReference]? = nil,
                         pending: [String]? = nil, resolved: [String] = [], deadline: Int64? = nil, traffic: TrafficState? = nil, maintenance: KeyMaintenanceState? = nil) -> Snapshot {
-        Snapshot(email: original.email, fingerprint: original.fingerprint, contacts: original.contacts,
+        Snapshot(account_id: original.account_id, username: testUsername(original.account_id), fingerprint: original.fingerprint, contacts: original.contacts,
                  outbox: outbox ?? original.outbox, messages: messages ?? original.messages,
                  groups: groups ?? original.groups, outbox_refs: refs ?? original.outbox_refs,
                  pending_group_senders: pending ?? original.pending_group_senders,
@@ -179,11 +208,10 @@ struct Configuration {
         environment = server.host == "api.isyeet.io" ? .production : .staging
     }
 }
-struct LoginResponse { let token: String; let email: String; let expires_at: Int64 }
-struct Credential { let idToken: String; let email: String }
-struct GoogleOAuth { @MainActor func idToken(configuration: Configuration) async throws -> Credential {
-    guard let email = Fixture.authEmail else { throw SafetyError.network }
-    return Credential(idToken: UUID().uuidString, email: email)
+struct LoginResponse { let token: String; let account_id: String; let username: String; let expires_at: Int64 }
+struct Passkeys { @MainActor func credential(_ challenge: PasskeyChallenge, configuration: Configuration, registering: Bool, securityKey: Bool = false, excludingCredentialID: String? = nil) async throws -> JSONValue {
+    guard Fixture.authAccountID != nil else { throw SafetyError.network }
+    return .object([:])
 } }
 struct CoreResult { let state: JSONValue?; let data: JSONValue?; var resolved_message_ids: [String]? = nil }
 enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavailable, rejected, verificationRequired, groupVerificationRequired, groupCapacityReached, identityChanged; var errorDescription: String? { "Synthetic core error" } }
@@ -196,7 +224,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         var pending = try object["pending_resolutions"]?.decoded([StoredMessage].self) ?? []
         pending = pending.filter { $0.isRetained(at: Int64(Date().timeIntervalSince1970)) }
         let warnings = try object["group_warnings"]?.decoded([String].self) ?? []
-        let canResolve = Fixture.allowResolve && !(Fixture.resolutionGroup?.members.contains { warnings.contains($0.email) } ?? false)
+        let canResolve = Fixture.allowResolve && !(Fixture.resolutionGroup?.members.contains { warnings.contains($0.account_id) } ?? false)
         let resolved = canResolve ? pending : []
         if canResolve { pending = [] }
         object["pending_resolutions"] = pending.isEmpty ? nil : try Fixture.json(pending)
@@ -209,11 +237,12 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
 
     func call(_ operation: String, state: JSONValue? = nil, fields: [String: JSONValue] = [:]) throws -> CoreResult {
         if operation == "init" {
-            guard case .string(let email) = fields["email"] else { throw CoreError.rejected }
-            let snapshot = Snapshot(email: email, fingerprint: String(repeating: "b", count: 64), contacts: [], outbox: [], messages: [], key_maintenance: KeyMaintenanceState(initial_upload_pending: true))
+            guard case .string(let account_id) = fields["account_id"] else { throw CoreError.rejected }
+            let snapshot = Snapshot(account_id: account_id, username: testUsername(account_id), fingerprint: String(repeating: "b", count: 64), contacts: [], outbox: [], messages: [], key_maintenance: KeyMaintenanceState(initial_upload_pending: true))
             return CoreResult(state: .object(["snapshot": try Fixture.json(snapshot), "identity": .string("new synthetic identity")]), data: nil)
         }
         guard let state else { throw CoreError.rejected }
+        if operation.hasPrefix("device_authority_") { return try deviceCall(operation, state: state, fields: fields) }
         let snapshot = try Fixture.snapshot(state)
         switch operation {
         case "confirm_traffic_quiet":
@@ -243,9 +272,9 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
             let updated = Fixture.updated(snapshot, outbox: snapshot.outbox + [outgoing], traffic: traffic)
             return CoreResult(state: try Fixture.replacing(state, snapshot: updated), data: try Fixture.json(outgoing))
         case "encrypt":
-            guard Fixture.selfMessages, fields["recipient"] == .string(snapshot.email),
+            guard Fixture.selfMessages, fields["recipient"] == .string(snapshot.account_id),
                   case .string = fields["text"] else { throw CoreError.rejected }
-            let outgoing = SendRequest(id: "00000000-0000-4000-8000-000000000090", recipient: snapshot.email,
+            let outgoing = SendRequest(id: "00000000-0000-4000-8000-000000000090", recipient: snapshot.account_id,
                                        envelope: "synthetic encrypted loopback", expires_at: Int64(Date().timeIntervalSince1970) + 60)
             let updated = Fixture.updated(snapshot, outbox: snapshot.outbox + [outgoing])
             guard case var .object(saved) = try Fixture.replacing(state, snapshot: updated) else { throw CoreError.rejected }
@@ -286,30 +315,30 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
             return CoreResult(state: try Fixture.replacing(state, snapshot: updated), data: try Fixture.json(updated))
         case "key_upload": return CoreResult(state: state, data: Fixture.keys())
         case "add_contact":
-            guard case .object(let bundle) = fields["bundle"], case .string(let email) = bundle["email"],
+            guard case .object(let bundle) = fields["bundle"], case .string(let account_id) = bundle["account_id"],
                   case .string(let fingerprint) = bundle["fingerprint"] else { throw CoreError.rejected }
-            if snapshot.contacts.contains(where: { $0.email == email }) { return CoreResult(state: state, data: nil) }
-            let updated = Snapshot(email: snapshot.email, fingerprint: snapshot.fingerprint,
-                contacts: snapshot.contacts + [Contact(email: email, fingerprint: fingerprint, verified: false)],
+            if snapshot.contacts.contains(where: { $0.account_id == account_id }) { return CoreResult(state: state, data: nil) }
+            let updated = Snapshot(account_id: snapshot.account_id, username: testUsername(snapshot.account_id), fingerprint: snapshot.fingerprint,
+                contacts: snapshot.contacts + [Contact(account_id: account_id, username: testUsername(account_id), fingerprint: fingerprint, verified: false)],
                 outbox: snapshot.outbox, messages: snapshot.messages, groups: snapshot.groups, outbox_refs: snapshot.outbox_refs)
             return CoreResult(state: try Fixture.replacing(state, snapshot: updated), data: nil)
         case "verify_contact":
-            guard case .string(let email) = fields["email"], case .string(let fingerprint) = fields["fingerprint"],
-                  snapshot.contacts.contains(where: { $0.email == email && $0.fingerprint == fingerprint }) else { throw CoreError.rejected }
-            let updated = Snapshot(email: snapshot.email, fingerprint: snapshot.fingerprint,
-                contacts: snapshot.contacts.map { $0.email == email ? Contact(email: email, fingerprint: fingerprint, verified: true) : $0 },
+            guard case .string(let account_id) = fields["account_id"], case .string(let fingerprint) = fields["fingerprint"],
+                  snapshot.contacts.contains(where: { $0.account_id == account_id && $0.fingerprint == fingerprint }) else { throw CoreError.rejected }
+            let updated = Snapshot(account_id: snapshot.account_id, username: testUsername(snapshot.account_id), fingerprint: snapshot.fingerprint,
+                contacts: snapshot.contacts.map { $0.account_id == account_id ? Contact(account_id: account_id, username: testUsername(account_id), fingerprint: fingerprint, verified: true) : $0 },
                 outbox: snapshot.outbox, messages: snapshot.messages, groups: snapshot.groups, outbox_refs: snapshot.outbox_refs)
             return CoreResult(state: try Fixture.replacing(state, snapshot: updated), data: nil)
         case "block_groups_for_contact":
-            guard case let .string(email) = fields["email"], case var .object(object) = state else { throw CoreError.rejected }
-            if let expected = fields["fingerprint"], !snapshot.contacts.contains(where: { $0.email == email && .string($0.fingerprint) == expected }) {
+            guard case let .string(account_id) = fields["account_id"], case var .object(object) = state else { throw CoreError.rejected }
+            if let expected = fields["fingerprint"], !snapshot.contacts.contains(where: { $0.account_id == account_id && .string($0.fingerprint) == expected }) {
                 return CoreResult(state: state, data: nil)
             }
             let warnings = try object["group_warnings"]?.decoded([String].self) ?? []
-            object["group_warnings"] = try Fixture.json(Array(Set(warnings + [email])).sorted())
+            object["group_warnings"] = try Fixture.json(Array(Set(warnings + [account_id])).sorted())
             let groups = snapshot.groups.map { group in
                 MessageGroup(id: group.id, title: group.title, members: group.members,
-                             blocked: group.blocked || group.members.contains { $0.email == email })
+                             blocked: group.blocked || group.members.contains { $0.account_id == account_id })
             }
             let blocked = Set(groups.filter(\.blocked).map(\.id))
             let removed = Set(snapshot.outbox_refs.filter { blocked.contains($0.group_id) }.map(\.id))
@@ -317,26 +346,26 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
                                           refs: snapshot.outbox_refs.filter { !removed.contains($0.id) })
             return CoreResult(state: try Fixture.replacing(.object(object), snapshot: updated), data: nil)
         case "create_group":
-            guard case let .string(title) = fields["title"], case let .array(emails) = fields["members"] else { throw CoreError.rejected }
-            let peers = try emails.map { value -> MessageGroup.Member in
-                guard case let .string(email) = value, let contact = snapshot.contacts.first(where: { $0.email == email && $0.verified }) else { throw CoreError.rejected }
-                return .init(email: email, fingerprint: contact.fingerprint)
+            guard case let .string(title) = fields["title"], case let .array(account_ids) = fields["members"] else { throw CoreError.rejected }
+            let peers = try account_ids.map { value -> MessageGroup.Member in
+                guard case let .string(account_id) = value, let contact = snapshot.contacts.first(where: { $0.account_id == account_id && $0.verified }) else { throw CoreError.rejected }
+                return .init(account_id: account_id, fingerprint: contact.fingerprint)
             }
             let group = MessageGroup(id: String(repeating: "1", count: 64), title: title,
-                                     members: [.init(email: snapshot.email, fingerprint: snapshot.fingerprint)] + peers, blocked: false)
+                                     members: [.init(account_id: snapshot.account_id, fingerprint: snapshot.fingerprint)] + peers, blocked: false)
             let updated = Fixture.updated(snapshot, groups: snapshot.groups + [group])
             return CoreResult(state: try Fixture.replacing(state, snapshot: updated), data: try Fixture.json(group))
         case "encrypt_group":
             guard case let .string(id) = fields["group_id"], case let .string(text) = fields["text"],
                   let group = snapshot.groups.first(where: { $0.id == id && !$0.blocked }) else { throw CoreError.rejected }
             let expiry = Int64(Date().timeIntervalSince1970) + 604_800
-            let recipients = group.members.filter { $0.email != snapshot.email }
-            let message = StoredMessage(id: "00000000-0000-4000-8000-000000000399", sender: snapshot.email,
-                                        recipient: snapshot.email, text: text, security_alert: nil, duplicate: false, expires_at: expiry,
+            let recipients = group.members.filter { $0.account_id != snapshot.account_id }
+            let message = StoredMessage(id: "00000000-0000-4000-8000-000000000399", sender: snapshot.account_id,
+                                        recipient: snapshot.account_id, text: text, security_alert: nil, duplicate: false, expires_at: expiry,
                                         group_id: group.id, sent_at: expiry - 604_800, sender_fingerprint: snapshot.fingerprint,
                                         status: "queued", accepted_count: 0, recipient_count: recipients.count)
             let envelopes = recipients.enumerated().map { index, member in
-                SendRequest(id: String(format: "00000000-0000-4000-8000-%012d", 400 + index), recipient: member.email,
+                SendRequest(id: String(format: "00000000-0000-4000-8000-%012d", 400 + index), recipient: member.account_id,
                             envelope: "synthetic group leg", expires_at: expiry)
             }
             let refs = envelopes.map { OutboxReference(id: $0.id, group_id: group.id, message_id: message.id, recipient: $0.recipient) }
@@ -344,19 +373,19 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
                                           refs: snapshot.outbox_refs + refs)
             return CoreResult(state: try Fixture.replacing(state, snapshot: updated), data: try Fixture.json(envelopes))
         case "remove_contact":
-            guard !Fixture.rejectReplacement, case let .string(email) = fields["email"],
+            guard !Fixture.rejectReplacement, case let .string(account_id) = fields["account_id"],
                   case let .string(old) = fields["previous_fingerprint"],
-                  snapshot.contacts.contains(where: { $0.email == email && $0.fingerprint == old }) else { throw CoreError.rejected }
+                  snapshot.contacts.contains(where: { $0.account_id == account_id && $0.fingerprint == old }) else { throw CoreError.rejected }
             let groups = snapshot.groups.map { group in
                 MessageGroup(id: group.id, title: group.title, members: group.members,
-                    blocked: group.blocked || group.members.contains { $0.email == email })
+                    blocked: group.blocked || group.members.contains { $0.account_id == account_id })
             }
             let blocked = Set(groups.filter(\.blocked).map(\.id))
             let cancelled = Set(snapshot.outbox_refs.filter { blocked.contains($0.group_id) }.map(\.id))
-            let updated = Snapshot(email: snapshot.email, fingerprint: snapshot.fingerprint,
-                contacts: snapshot.contacts.filter { $0.email != email },
-                outbox: snapshot.outbox.filter { $0.recipient != email && !cancelled.contains($0.id) },
-                messages: snapshot.messages.filter { $0.group_id != nil || ($0.sender != email && $0.recipient != email) },
+            let updated = Snapshot(account_id: snapshot.account_id, username: testUsername(snapshot.account_id), fingerprint: snapshot.fingerprint,
+                contacts: snapshot.contacts.filter { $0.account_id != account_id },
+                outbox: snapshot.outbox.filter { $0.recipient != account_id && !cancelled.contains($0.id) },
+                messages: snapshot.messages.filter { $0.group_id != nil || ($0.sender != account_id && $0.recipient != account_id) },
                 groups: groups, outbox_refs: snapshot.outbox_refs.filter { !cancelled.contains($0.id) })
             return CoreResult(state: try Fixture.replacing(state, snapshot: updated), data: nil)
         case "decrypt":
@@ -368,7 +397,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
             }
             if Fixture.coverArrives {
                 let incoming = try fields["message"]!.decoded(QueuedMessage.self)
-                let cover = StoredMessage(id: incoming.id, sender: incoming.sender, recipient: snapshot.email, text: nil,
+                let cover = StoredMessage(id: incoming.id, sender: incoming.sender, recipient: snapshot.account_id, text: nil,
                                           security_alert: nil, duplicate: false, expires_at: Int64(Date().timeIntervalSince1970) + 60, cover: true)
                 return CoreResult(state: try Fixture.replacing(state, snapshot: snapshot, consumed: true), data: try Fixture.json(cover))
             }
@@ -376,35 +405,35 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
                 guard case var .object(object) = state else { throw CoreError.rejected }
                 object["pending_resolutions"] = try Fixture.json([pending])
                 let updated = Fixture.updated(snapshot, pending: [pending.sender], deadline: pending.expires_at)
-                let deferred = StoredMessage(id: Fixture.incoming[0].id, sender: pending.sender, recipient: snapshot.email,
+                let deferred = StoredMessage(id: Fixture.incoming[0].id, sender: pending.sender, recipient: snapshot.account_id,
                                              text: nil, security_alert: nil, duplicate: false, expires_at: pending.expires_at, deferred: true)
                 return CoreResult(state: try Fixture.replacing(.object(object), snapshot: updated, consumed: true), data: try Fixture.json(deferred))
             }
             if Fixture.selfMessages {
                 guard case let .object(saved) = state, case let .string(text) = saved["synthetic_loopback_text"] else { throw CoreError.rejected }
                 if snapshot.messages.contains(where: { $0.id == Fixture.incoming[0].id }) {
-                    let duplicate = StoredMessage(id: Fixture.incoming[0].id, sender: snapshot.email, recipient: snapshot.email,
+                    let duplicate = StoredMessage(id: Fixture.incoming[0].id, sender: snapshot.account_id, recipient: snapshot.account_id,
                                                   text: nil, security_alert: nil, duplicate: true, expires_at: 0)
                     return CoreResult(state: state, data: try Fixture.json(duplicate))
                 }
-                let message = StoredMessage(id: Fixture.incoming[0].id, sender: snapshot.email, recipient: snapshot.email,
+                let message = StoredMessage(id: Fixture.incoming[0].id, sender: snapshot.account_id, recipient: snapshot.account_id,
                                             text: Fixture.rejectSelfReturn ? nil : text,
                                             security_alert: Fixture.rejectSelfReturn ? "synthetic rejection" : nil,
                                             duplicate: false, expires_at: Int64(Date().timeIntervalSince1970) + 60)
-                let updated = Snapshot(email: snapshot.email, fingerprint: snapshot.fingerprint, contacts: snapshot.contacts,
+                let updated = Snapshot(account_id: snapshot.account_id, username: testUsername(snapshot.account_id), fingerprint: snapshot.fingerprint, contacts: snapshot.contacts,
                                        outbox: snapshot.outbox, messages: snapshot.messages + [message])
                 return CoreResult(state: try Fixture.replacing(state, snapshot: updated, consumed: true), data: try Fixture.json(message))
             }
             if Fixture.identityChangedOnDecrypt {
-                guard snapshot.contacts.contains(where: { $0.email == "alice@gmail.com" && $0.fingerprint == String(repeating: "b", count: 64) }) else { throw CoreError.identityChanged }
-                let message = StoredMessage(id: Fixture.incoming[0].id, sender: "alice@gmail.com", recipient: "me@gmail.com",
+                guard snapshot.contacts.contains(where: { $0.account_id == "0beaac69-d53e-48d2-b5aa-dd405b7f414d" && $0.fingerprint == String(repeating: "b", count: 64) }) else { throw CoreError.identityChanged }
+                let message = StoredMessage(id: Fixture.incoming[0].id, sender: "0beaac69-d53e-48d2-b5aa-dd405b7f414d", recipient: "81d1a713-5b97-4257-bfb4-f094a2004296",
                                             text: "new synthetic identity", security_alert: nil, duplicate: false,
                                             expires_at: Int64(Date().timeIntervalSince1970) + 60)
-                let updated = Snapshot(email: snapshot.email, fingerprint: snapshot.fingerprint, contacts: snapshot.contacts,
+                let updated = Snapshot(account_id: snapshot.account_id, username: testUsername(snapshot.account_id), fingerprint: snapshot.fingerprint, contacts: snapshot.contacts,
                                        outbox: snapshot.outbox, messages: snapshot.messages + [message])
                 return CoreResult(state: try Fixture.replacing(state, snapshot: updated, consumed: true), data: try Fixture.json(message))
             }
-            let message = StoredMessage(id: Fixture.incoming[0].id, sender: "alice@gmail.com", recipient: "me@gmail.com",
+            let message = StoredMessage(id: Fixture.incoming[0].id, sender: "0beaac69-d53e-48d2-b5aa-dd405b7f414d", recipient: "81d1a713-5b97-4257-bfb4-f094a2004296",
                                         text: nil, security_alert: nil, duplicate: false, expires_at: 1, expired: true)
             return CoreResult(state: try Fixture.replacing(state, snapshot: snapshot, consumed: true), data: try Fixture.json(message))
         default: throw CoreError.rejected
@@ -414,20 +443,63 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
 @MainActor struct API {
     static let inboxPageSize = 50
     let base: URL
-    func login(idToken: String) async throws -> LoginResponse {
+    private func challenge() -> PasskeyChallenge {
+        PasskeyChallenge(challenge_id: UUID().uuidString.lowercased(), account_id: Fixture.authAccountID, username: Fixture.authAccountID.map(testUsername),
+            public_key: PasskeyOptions(challenge: "AA", rp: nil, rpId: nil, user: nil, excludeCredentials: nil, allowCredentials: nil, pubKeyCredParams: nil))
+    }
+    func registrationStart(username: String) async throws -> PasskeyChallenge { challenge() }
+    func loginStart() async throws -> PasskeyChallenge { challenge() }
+    func loginFinish(challengeID: String, credential: JSONValue, registering: Bool) async throws -> LoginResponse {
         Fixture.loginCalls += 1
-        guard let email = Fixture.authEmail else { throw SafetyError.network }
-        return LoginResponse(token: "renewed synthetic", email: email, expires_at: Int64.max)
+        guard let account_id = Fixture.authAccountID else { throw SafetyError.network }
+        return LoginResponse(token: "renewed synthetic", account_id: account_id, username: testUsername(account_id), expires_at: Int64.max)
+    }
+    func reauthenticationStart(token: String, purpose: String) async throws -> PasskeyChallenge {
+        if purpose == "device_manage" { Fixture.deviceProofs += 1 }
+        return challenge()
+    }
+    func reauthenticationFinish(token: String, challengeID: String, credential: JSONValue) async throws -> PasskeyAction {
+        PasskeyAction(action_token: "synthetic-action-proof", expires_at: Int64.max)
+    }
+    func passkeys(token: String) async throws -> [RegisteredPasskey] { [] }
+    func deviceAuthority(token: String) async throws -> DeviceAuthorityResponse {
+        Fixture.deviceAuthorityCalls += 1
+        guard Fixture.deviceNetworkEnabled else { throw SafetyError.network }
+        return .init(authority: Fixture.deviceRemoteAuthority, server_time: Int64(Date().timeIntervalSince1970), messaging_available: false)
+    }
+    func changeDeviceAuthority(_ change: JSONValue, token: String, actionToken: String) async throws -> DeviceAuthorityReceipt {
+        Fixture.deviceAuthorityCalls += 1
+        guard Fixture.deviceNetworkEnabled else { throw SafetyError.network }
+        Fixture.deviceMutationCalls.append(change)
+        guard !Fixture.deviceRejectMutation else { throw SafetyError.network }
+        guard case .object(let signed) = change, case .object(let body) = signed["change"],
+              let roster = body["roster"], case .string(let operationID) = body["operation_id"] else { throw SafetyError.invalidResponse }
+        Fixture.deviceRemoteAuthority = roster
+        if Fixture.deviceLoseReceipt { throw SafetyError.network }
+        return .init(operation_id: operationID, roster_version: 1, roster_hash: String(repeating: "a", count: 64), messaging_available: false)
+    }
+    func addPasskeyStart(token: String, actionToken: String, label: String) async throws -> PasskeyChallenge { challenge() }
+    func addPasskeyFinish(token: String, challengeID: String, credential: JSONValue) async throws {}
+    func removePasskey(id: String, token: String, actionToken: String) async throws {}
+    func lookup(username: String, token: String) async throws -> DirectoryAccount {
+        let pairs = ["me_test": "81d1a713-5b97-4257-bfb4-f094a2004296", "alice": "0beaac69-d53e-48d2-b5aa-dd405b7f414d", "bob": "300db02d-b75a-4922-8759-f08a0efa5a40", "carol": "c36e0493-49f8-4439-aa4c-2aa333bf235f", "dave": "781e65af-8b81-4d42-9fef-a6bc1253f62f", "outsider": "9fa56b84-e436-4423-8452-b98816524ec5", "other": "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130", "elsewhere": "ee9c5bcd-53b5-4939-b07a-8e021c7b6cfc", "a_test": "75f4499b-5920-4d38-b057-e967e297590a"]
+        guard let id = pairs[username] else { throw SafetyError.invalidUsername }
+        return DirectoryAccount(account_id: id, username: username)
     }
     func requireUnregisteredIdentity(token: String) async throws {
         if Fixture.registrationExists { throw SafetyError.identityAlreadyRegistered }
     }
-    func accountState(idToken: String, email: String) async throws -> AccountStateResponse? {
+    func accountState(token: String, account_id: String) async throws -> AccountStateResponse? {
         guard !Fixture.remoteAbsent else { return nil }
-        return AccountStateResponse(email: email, generation: Fixture.remoteGeneration,
+        return AccountStateResponse(account_id: account_id, generation: Fixture.remoteGeneration,
             identity_fingerprint: Fixture.remoteFingerprint, server_time: Fixture.operationServerTime ?? Int64(Date().timeIntervalSince1970))
     }
-    func performAccountOperation(_ operation: AccountOperation, idToken: String) async throws {
+    func accountState(actionToken: String, account_id: String) async throws -> AccountStateResponse? {
+        guard !Fixture.remoteAbsent else { return nil }
+        return AccountStateResponse(account_id: account_id, generation: Fixture.remoteGeneration,
+            identity_fingerprint: Fixture.remoteFingerprint, server_time: Fixture.operationServerTime ?? Int64(Date().timeIntervalSince1970))
+    }
+    func performAccountOperation(_ operation: AccountOperation) async throws {
         precondition(Fixture.operation == operation, "Destructive request before exact journal save")
         if operation.kind == .reenroll { precondition(operation.preparedCore != nil && operation.preparedKeys != nil) }
         Fixture.operationRequests.append(operation)
@@ -455,14 +527,14 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         if Fixture.mismatchSignedKeys { keys["signed_pre_key"] = .string("unknown signed key") }
         return .object(keys)
     }
-    func claim(email: String, token: String) async throws -> JSONValue {
+    func claim(account_id: String, token: String) async throws -> JSONValue {
         Fixture.keyClaims += 1
         if Fixture.holdClaim { await withCheckedContinuation { Fixture.heldClaim = $0 } }
         if Fixture.claimError { throw SafetyError.network }
-        return Fixture.claimBundle ?? .object(["email": .string(email), "fingerprint": .string(String(repeating: "b", count: 64))])
+        return Fixture.claimBundle ?? .object(["account_id": .string(account_id), "username": .string(testUsername(account_id)), "fingerprint": .string(String(repeating: "b", count: 64))])
     }
     func upload(keys: JSONValue, token: String) async throws { Fixture.uploads += 1; if Fixture.failUpload { throw SafetyError.network } }
-    func syncContacts(emails: [String], token: String) async throws {
+    func syncContacts(account_ids: [String], token: String) async throws {
         Fixture.permissionUpdates += 1
         if Fixture.holdPermissions { await withCheckedContinuation { Fixture.heldPermissions = $0 } }
         if Fixture.failPermissions { throw SafetyError.network }
@@ -515,11 +587,11 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
     @MainActor static func main() async throws {
         func now() -> Int64 { Int64(Date().timeIntervalSince1970) }
         func message(_ index: Int, expiry: Int64) -> StoredMessage {
-            StoredMessage(id: String(format: "00000000-0000-4000-8000-%012d", index), sender: "alice@gmail.com",
-                          recipient: "me@gmail.com", text: "synthetic", security_alert: nil, duplicate: false, expires_at: expiry)
+            StoredMessage(id: String(format: "00000000-0000-4000-8000-%012d", index), sender: "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
+                          recipient: "81d1a713-5b97-4257-bfb4-f094a2004296", text: "synthetic", security_alert: nil, duplicate: false, expires_at: expiry)
         }
         func envelope(_ index: Int, expiry: Int64) -> SendRequest {
-            SendRequest(id: String(format: "00000000-0000-4000-8000-%012d", index), recipient: "alice@gmail.com",
+            SendRequest(id: String(format: "00000000-0000-4000-8000-%012d", index), recipient: "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
                         envelope: "synthetic ciphertext", expires_at: expiry)
         }
         func waitUntil(_ condition: () -> Bool) async throws {
@@ -530,8 +602,27 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
             try await Task.sleep(for: .seconds(max(0.1, Double(deadline) - Date().timeIntervalSince1970 + 0.2)))
         }
 
+        #if DEBUG && ISYEET_DEVICE_AUTHORIZATION_EXPERIMENT
+        try await runDeviceAuthorizationChecks()
+        #else
+        // The ordinary app cannot reach experimental authorization even when
+        // its methods are invoked directly, bypassing the hidden Settings link.
+        try Fixture.reset([], sessionValid: true)
+        let gatedDevices = AppModel()
+        precondition(!gatedDevices.experimentalDeviceAuthorizationAvailable)
+        await gatedDevices.refreshMessagingDevices()
+        await gatedDevices.prepareMessagingDeviceAuthority()
+        await gatedDevices.inspectDevicePairing("ISYEET-LINK-1:e30")
+        await gatedDevices.resumeDeviceAuthorization()
+        await gatedDevices.approveReviewedDevice()
+        let syntheticDevice = DeviceRosterMember(certificate: .init(account_id: "81d1a713-5b97-4257-bfb4-f094a2004296", root_epoch: "synthetic", device_id: 2,
+                identity_key: "synthetic", registration_id: 1, label: "Synthetic", request_hash: "synthetic"), signature: "synthetic")
+        await gatedDevices.revokeMessagingDevice(syntheticDevice)
+        precondition(Fixture.deviceAuthorityCalls == 0 && gatedDevices.deviceAuthority == nil && gatedDevices.devicePairingReview == nil)
+        print("PASS disabled device authorization cannot access experimental endpoints or create a proposal")
+
         // Loading never publishes an expired record; refresh still cleans up
-        // with an expired OAuth session and without any network call.
+        // with an expired login session and without any network call.
         let deadline = now() + 2
         try Fixture.reset([message(1, expiry: now() - 1), message(2, expiry: deadline)], outbox: [envelope(2, expiry: deadline)])
         let offline = AppModel()
@@ -585,7 +676,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         try Fixture.reset([message(5, expiry: failureDeadline)], sessionValid: true)
         Fixture.holdClaim = true
         let failed = AppModel(); failed.setAppActive(true)
-        let lookup = Task { await failed.addContact("bob@gmail.com") }
+        let lookup = Task { await failed.addContact("bob") }
         try await waitUntil { Fixture.heldClaim != nil }
         Fixture.failSave = true
         try await waitPast(failureDeadline)
@@ -602,7 +693,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         // The expired arrival consumes ratchet/dedupe state before its ACK;
         // it creates no message row, security alert or unread indicator.
         try Fixture.reset([], sessionValid: true)
-        Fixture.incoming = [QueuedMessage(id: message(20, expiry: 1).id, sender: "alice@gmail.com", envelope: "synthetic", created_at: 1)]
+        Fixture.incoming = [QueuedMessage(id: message(20, expiry: 1).id, sender: "0beaac69-d53e-48d2-b5aa-dd405b7f414d", envelope: "synthetic", created_at: 1)]
         let receiver = AppModel()
         await receiver.refresh()
         precondition(Fixture.acknowledgements == 1 && receiver.snapshot?.messages.isEmpty == true)
@@ -614,7 +705,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         // must never be used for another send or incoming acknowledgment.
         let partialDeadline = now() + 2
         try Fixture.reset([message(40, expiry: partialDeadline)], sessionValid: true)
-        Fixture.incoming = [QueuedMessage(id: message(41, expiry: 1).id, sender: "alice@gmail.com", envelope: "synthetic", created_at: 1)]
+        Fixture.incoming = [QueuedMessage(id: message(41, expiry: 1).id, sender: "0beaac69-d53e-48d2-b5aa-dd405b7f414d", envelope: "synthetic", created_at: 1)]
         let partial = AppModel()
         Fixture.delaySaveUntil = partialDeadline
         Fixture.failAtWrite = Fixture.writes + 2
@@ -622,7 +713,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         precondition(partial.snapshot == nil && partial.fatalError != nil && Fixture.acknowledgements == 0)
         if case let .object(state) = Fixture.saved?.core { precondition(state["consumed"] == .bool(true)) }
         else { preconditionFailure("Successful first write lost") }
-        let allowedSend = await partial.send(text: "synthetic", recipient: "alice@gmail.com")
+        let allowedSend = await partial.send(text: "synthetic", recipient: "0beaac69-d53e-48d2-b5aa-dd405b7f414d")
         await partial.refresh()
         precondition(!allowedSend && Fixture.sent.isEmpty && Fixture.acknowledgements == 0 && partial.snapshot == nil)
         Fixture.failAtWrite = nil
@@ -633,30 +724,30 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
             precondition(state["identity"] == .string("unchanged synthetic key marker"))
         } else { preconditionFailure("Identity marker lost") }
 
-        let alice = Contact(email: "alice@gmail.com", fingerprint: String(repeating: "a", count: 64), verified: true)
-        let bob = Contact(email: "bob@gmail.com", fingerprint: String(repeating: "c", count: 64), verified: true)
+        let alice = Contact(account_id: "0beaac69-d53e-48d2-b5aa-dd405b7f414d", username: testUsername("0beaac69-d53e-48d2-b5aa-dd405b7f414d"), fingerprint: String(repeating: "a", count: 64), verified: true)
+        let bob = Contact(account_id: "300db02d-b75a-4922-8759-f08a0efa5a40", username: testUsername("300db02d-b75a-4922-8759-f08a0efa5a40"), fingerprint: String(repeating: "c", count: 64), verified: true)
         // Management/composer/settings presentations can cover a chat whose
         // navigation identity remains selected. Incoming text is durably unread
         // until the actual conversation is visible again, not merely selected.
         for (index, sheet) in ["contact-details", "compose", "add-contact", "new-group", "appearance"].enumerated() {
             try Fixture.reset([], sessionValid: true, contacts: [alice, bob])
             let coveredChat = AppModel(); coveredChat.setAppActive(true)
-            coveredChat.conversationDidAppear(alice.email)
+            coveredChat.conversationDidAppear(alice.account_id)
             coveredChat.setPresentationCovered(sheet, covered: true)
             let arrival = message(800 + index, expiry: now() + 60)
             Fixture.directArrival = arrival
-            Fixture.incoming = [QueuedMessage(id: arrival.id, sender: alice.email, envelope: "synthetic sheet arrival", created_at: now())]
+            Fixture.incoming = [QueuedMessage(id: arrival.id, sender: alice.account_id, envelope: "synthetic sheet arrival", created_at: now())]
             await coveredChat.refresh(quiet: true)
-            precondition(Fixture.acknowledgements == 1 && coveredChat.unreadCounts == [alice.email: 1])
+            precondition(Fixture.acknowledgements == 1 && coveredChat.unreadCounts == [alice.account_id: 1])
             precondition(Fixture.saved?.unreadMessageIDs == [arrival.id] && coveredChat.showsNewMessageIndicator)
             let navigation = coveredChat.inboxNavigationSequence
             coveredChat.showInbox()
             precondition(coveredChat.inboxNavigationSequence == navigation + 1)
             coveredChat.setPresentationCovered(sheet, covered: false)
-            coveredChat.conversationDidDisappear(alice.email)
+            coveredChat.conversationDidDisappear(alice.account_id)
             coveredChat.updateReadVisibility()
             precondition(coveredChat.unreadCount == 1 && Fixture.saved?.unreadMessageIDs == [arrival.id], "Returning to inbox must not read the covered chat")
-            coveredChat.conversationDidAppear(alice.email)
+            coveredChat.conversationDidAppear(alice.account_id)
             precondition(coveredChat.unreadCount == 0 && Fixture.saved?.unreadMessageIDs.isEmpty == true)
             coveredChat.setAppActive(false)
             print("PASS \(sheet) arrival stays unread through inbox return until conversation opens")
@@ -669,7 +760,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         let nestedSheets = AppModel(); nestedSheets.setAppActive(true)
         nestedSheets.setPresentationCovered("contact-details", covered: true)
         nestedSheets.setPresentationCovered("compose", covered: true)
-        nestedSheets.conversationDidAppear(alice.email)
+        nestedSheets.conversationDidAppear(alice.account_id)
         precondition(nestedSheets.unreadCount == 1)
         nestedSheets.setPresentationCovered("contact-details", covered: false)
         precondition(nestedSheets.unreadCount == 1 && Fixture.saved?.unreadMessageIDs == [nestedArrival.id])
@@ -686,11 +777,11 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         try Fixture.reset([olderPreview, newestPreview], contacts: [alice])
         let previewExpiry = AppModel(); previewExpiry.setAppActive(true)
         previewExpiry.setPresentationCovered("contact-management:synthetic", covered: true)
-        previewExpiry.conversationDidAppear(alice.email)
-        let initialPreview = previewExpiry.snapshot?.conversations(unreadCounts: previewExpiry.unreadCounts, at: now()).first { $0.id == alice.email }
+        previewExpiry.conversationDidAppear(alice.account_id)
+        let initialPreview = previewExpiry.snapshot?.conversations(unreadCounts: previewExpiry.unreadCounts, at: now()).first { $0.id == alice.account_id }
         precondition(initialPreview?.preview == newestPreview.text && initialPreview?.latestMessageID == newestPreview.id && initialPreview?.unreadCount == 2)
         try await waitPast(previewDeadline)
-        let retainedPreview = previewExpiry.snapshot?.conversations(unreadCounts: previewExpiry.unreadCounts, at: now()).first { $0.id == alice.email }
+        let retainedPreview = previewExpiry.snapshot?.conversations(unreadCounts: previewExpiry.unreadCounts, at: now()).first { $0.id == alice.account_id }
         precondition(retainedPreview?.preview == olderPreview.text && retainedPreview?.latestMessageID == olderPreview.id && retainedPreview?.unreadCount == 1)
         precondition(previewExpiry.snapshot?.message(id: newestPreview.id, at: now()) == nil)
         let savedPreview = try Fixture.snapshot(Fixture.saved!.core)
@@ -704,20 +795,20 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
 
         let removal = ContactRemoval(contact: alice)
         let newFingerprint = String(repeating: "b", count: 64)
-        let retainedBob = StoredMessage(id: message(51, expiry: now() + 60).id, sender: bob.email, recipient: "me@gmail.com",
+        let retainedBob = StoredMessage(id: message(51, expiry: now() + 60).id, sender: bob.account_id, recipient: "81d1a713-5b97-4257-bfb4-f094a2004296",
             text: "other contact", security_alert: nil, duplicate: false, expires_at: now() + 60)
-        let retainedBobOutbox = SendRequest(id: envelope(53, expiry: now() + 60).id, recipient: bob.email,
+        let retainedBobOutbox = SendRequest(id: envelope(53, expiry: now() + 60).id, recipient: bob.account_id,
             envelope: "other unchanged ciphertext", expires_at: now() + 60)
         try Fixture.reset([message(50, expiry: now() + 60), retainedBob],
             outbox: [envelope(52, expiry: now() + 60), retainedBobOutbox], sessionValid: true, contacts: [alice, bob])
-        Fixture.saved?.contactIdentityChanges = [alice.email]
+        Fixture.saved?.contactIdentityChanges = [alice.account_id]
         let removing = AppModel()
         removing.setPresentationCovered("contact-remove", covered: true)
         let removed = await removing.removeContact(removal)
         precondition(removed == .removed && Fixture.permissionUpdates == 1 && Fixture.sent.isEmpty)
         let removedSaved = try Fixture.snapshot(Fixture.saved!.core)
         precondition(removedSaved.contacts == [bob] && removedSaved.messages == [retainedBob])
-        precondition(removedSaved.outbox.map(\.id) == [retainedBobOutbox.id] && removing.unreadCounts == [bob.email: 1])
+        precondition(removedSaved.outbox.map(\.id) == [retainedBobOutbox.id] && removing.unreadCounts == [bob.account_id: 1])
         let stale = await removing.removeContact(removal)
         if case .failed = stale {} else { preconditionFailure("Stale removal accepted") }
         precondition(Fixture.permissionUpdates == 1)
@@ -743,7 +834,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         print("PASS permission failure reports committed removal with retryable permission sync")
 
         let removalDeadline = now() + 2
-        let expiredBob = StoredMessage(id: message(70, expiry: removalDeadline).id, sender: bob.email, recipient: "me@gmail.com",
+        let expiredBob = StoredMessage(id: message(70, expiry: removalDeadline).id, sender: bob.account_id, recipient: "81d1a713-5b97-4257-bfb4-f094a2004296",
             text: "expires during permission update", security_alert: nil, duplicate: false, expires_at: removalDeadline)
         try Fixture.reset([message(71, expiry: now() + 60), expiredBob], sessionValid: true, contacts: [alice, bob])
         Fixture.holdPermissions = true
@@ -759,35 +850,35 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
 
         try Fixture.reset([], sessionValid: true, contacts: [alice])
         Fixture.identityChangedOnDecrypt = true
-        Fixture.incoming = [QueuedMessage(id: message(80, expiry: 1).id, sender: alice.email, envelope: "same new-identity ciphertext", created_at: 1)]
+        Fixture.incoming = [QueuedMessage(id: message(80, expiry: 1).id, sender: alice.account_id, envelope: "same new-identity ciphertext", created_at: 1)]
         let blocked = AppModel(); Fixture.failSave = true
         await blocked.refresh()
         precondition(blocked.fatalError != nil && blocked.snapshot == nil && Fixture.acknowledgements == 0)
         Fixture.failSave = false; blocked.retryLoad()
-        precondition(blocked.pendingIdentityChanges == [alice.email] && Fixture.saved?.contactIdentityChanges == [alice.email])
+        precondition(blocked.pendingIdentityChanges == [alice.account_id] && Fixture.saved?.contactIdentityChanges == [alice.account_id])
         let relaunched = blocked // Same instance must preserve then transactionally clear observed warning.
-        let blockedSend = await relaunched.send(text: "synthetic", recipient: alice.email)
+        let blockedSend = await relaunched.send(text: "synthetic", recipient: alice.account_id)
         precondition(!blockedSend && Fixture.sent.isEmpty)
         let removedChanged = await relaunched.removeContact(removal)
         precondition(removedChanged == .removed && relaunched.snapshot?.contacts.isEmpty == true)
         Fixture.incoming = []
-        await relaunched.addContact(alice.email)
+        await relaunched.addContact(alice.username)
         precondition(relaunched.snapshot?.contacts.first?.verified == false)
-        await relaunched.verifyContact(email: alice.email, fingerprint: newFingerprint)
-        Fixture.incoming = [QueuedMessage(id: message(80, expiry: 1).id, sender: alice.email, envelope: "same new-identity ciphertext", created_at: 1)]
+        await relaunched.verifyContact(account_id: alice.account_id, fingerprint: newFingerprint)
+        Fixture.incoming = [QueuedMessage(id: message(80, expiry: 1).id, sender: alice.account_id, envelope: "same new-identity ciphertext", created_at: 1)]
         await relaunched.refresh()
         precondition(Fixture.acknowledgements == 1 && relaunched.snapshot?.messages.first?.text == "new synthetic identity")
         print("PASS changed-key recovery requires removal plus fresh add and independent verification")
 
         let partialRemovalDeadline = now() + 2
-        let expiringOther = StoredMessage(id: message(91, expiry: partialRemovalDeadline).id, sender: bob.email,
-            recipient: "me@gmail.com", text: "unrelated expiry", security_alert: nil, duplicate: false, expires_at: partialRemovalDeadline)
+        let expiringOther = StoredMessage(id: message(91, expiry: partialRemovalDeadline).id, sender: bob.account_id,
+            recipient: "81d1a713-5b97-4257-bfb4-f094a2004296", text: "unrelated expiry", security_alert: nil, duplicate: false, expires_at: partialRemovalDeadline)
         try Fixture.reset([expiringOther], sessionValid: true, contacts: [alice, bob])
         Fixture.identityChangedOnDecrypt = true
-        Fixture.incoming = [QueuedMessage(id: message(92, expiry: 1).id, sender: alice.email, envelope: "changed identity", created_at: 1)]
+        Fixture.incoming = [QueuedMessage(id: message(92, expiry: 1).id, sender: alice.account_id, envelope: "changed identity", created_at: 1)]
         let partialRemoval = AppModel(); Fixture.failSave = true; await partialRemoval.refresh()
         Fixture.failSave = false; partialRemoval.retryLoad()
-        precondition(partialRemoval.pendingIdentityChanges == [alice.email])
+        precondition(partialRemoval.pendingIdentityChanges == [alice.account_id])
         Fixture.delaySaveUntil = partialRemovalDeadline; Fixture.failAtWrite = Fixture.writes + 2
         let failedCleanup = await partialRemoval.removeContact(removal)
         if case .failed = failedCleanup {} else { preconditionFailure("Expected second cleanup save failure") }
@@ -800,7 +891,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         for failure in ["auth", "save-intent", "remote", "receipt-save", "local-clear", "journal-clear"] {
             try Fixture.reset([message(100, expiry: now() + 60)], sessionValid: true, contacts: [alice])
             let deleting = AppModel(); let original = Fixture.saved
-            Fixture.authEmail = failure == "auth" ? "other@gmail.com" : "me@gmail.com"
+            Fixture.authAccountID = failure == "auth" ? "18ae18f2-64c2-4442-a0aa-fe2ef8d2d130" : "81d1a713-5b97-4257-bfb4-f094a2004296"
             Fixture.failOperationSave = failure == "save-intent"
             Fixture.failRemoteOperation = failure == "remote"
             Fixture.failReceiptSave = failure == "receipt-save"
@@ -824,12 +915,12 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         print("PASS deletion binds fresh account, journals before request and resumes safely across every storage/network boundary")
 
         try Fixture.reset([message(101, expiry: now() + 60)], sessionValid: true)
-        Fixture.authEmail = "me@gmail.com"; Fixture.holdAccountOperation = true
+        Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"; Fixture.holdAccountOperation = true
         let deletingAwait = AppModel(); let originalDeleteState = Fixture.saved
         let deletion = Task { await deletingAwait.beginAccountDeletion() }
         try await waitUntil { Fixture.heldAccountOperation != nil }
         precondition(Fixture.saved == originalDeleteState && deletingAwait.snapshot == nil)
-        let pausedSend = await deletingAwait.send(text: "cannot send", recipient: "me@gmail.com")
+        let pausedSend = await deletingAwait.send(text: "cannot send", recipient: "81d1a713-5b97-4257-bfb4-f094a2004296")
         precondition(!pausedSend && Fixture.sent.isEmpty)
         Fixture.heldAccountOperation?.resume(); Fixture.heldAccountOperation = nil
         await deletion.value
@@ -838,9 +929,9 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
 
         for mismatch in [false, true] {
             try Fixture.reset([], sessionValid: true)
-            Fixture.saved = nil; Fixture.authEmail = "me@gmail.com"; Fixture.registrationExists = true
+            Fixture.saved = nil; Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"; Fixture.registrationExists = true
             let reenrolling = AppModel(); await reenrolling.signIn()
-            precondition(reenrolling.reenrollmentEmail == "me@gmail.com" && Fixture.saved == nil)
+            precondition(reenrolling.reenrollmentAccountID == "81d1a713-5b97-4257-bfb4-f094a2004296" && Fixture.saved == nil)
             reenrolling.alert = nil; Fixture.failRemoteOperation = true
             await reenrolling.beginReenrollment()
             precondition(Fixture.saved == nil && Fixture.operation?.preparedCore != nil && reenrolling.snapshot == nil)
@@ -860,14 +951,14 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         // Expired unexecuted intent is cancellable only after signed state proves
         // the original generation/pin still exists past the fixed deadline.
         try Fixture.reset([message(110, expiry: now() + 60)], sessionValid: true)
-        Fixture.authEmail = "me@gmail.com"; Fixture.failRemoteOperation = true
+        Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"; Fixture.failRemoteOperation = true
         let expiredIntent = AppModel(); await expiredIntent.beginAccountDeletion()
         let savedIntent = Fixture.operation!
         Fixture.failRemoteOperation = false; Fixture.conflictOperation = true
         Fixture.operationServerTime = savedIntent.expiresAt
         await expiredIntent.resumeAccountOperation()
         precondition(expiredIntent.canCancelAccountOperation && !expiredIntent.canDiscardAccountOperation)
-        precondition(Fixture.operation == savedIntent && Fixture.loginCalls == 0)
+        precondition(Fixture.operation == savedIntent && Fixture.loginCalls == 1)
         expiredIntent.cancelExpiredAccountOperation()
         precondition(Fixture.operation == nil && expiredIntent.snapshot?.messages.count == 1)
         print("PASS expired unexecuted operation restores old account only after explicit cancellation")
@@ -875,27 +966,27 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         // A historical receipt is tried before current account state, so a new
         // generation cannot strand cleanup or be deleted by the old request.
         try Fixture.reset([], sessionValid: true)
-        Fixture.authEmail = "me@gmail.com"; Fixture.failRemoteOperation = true
+        Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"; Fixture.failRemoteOperation = true
         let historicalReceipt = AppModel(); await historicalReceipt.beginAccountDeletion()
         Fixture.failRemoteOperation = false
         Fixture.remoteGeneration = "00000000-0000-4000-8000-000000000099"
         await historicalReceipt.resumeAccountOperation()
-        precondition(Fixture.saved == nil && Fixture.operation == nil && Fixture.loginCalls == 0)
+        precondition(Fixture.saved == nil && Fixture.operation == nil && Fixture.loginCalls == 1)
         print("PASS historical deletion receipt completes local cleanup despite recreated remote generation")
 
-        // After receipt collection, absent account is reconciled without login
-        // (normal Google login would recreate a deleted registration).
+        // After receipt collection, an absent account is reconciled without
+        // asking for a passkey that account deletion has already removed.
         try Fixture.reset([], sessionValid: true)
-        Fixture.authEmail = "me@gmail.com"; Fixture.failRemoteOperation = true
+        Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"; Fixture.failRemoteOperation = true
         let goneAccount = AppModel(); await goneAccount.beginAccountDeletion()
         Fixture.failRemoteOperation = false; Fixture.conflictOperation = true; Fixture.remoteAbsent = true
         await goneAccount.resumeAccountOperation()
-        precondition(Fixture.saved == nil && Fixture.operation == nil && Fixture.loginCalls == 0)
+        precondition(Fixture.saved == nil && Fixture.operation == nil && Fixture.loginCalls == 1)
         print("PASS expired deletion receipt plus absent registration clears locally without account creation")
 
         for remoteState in ["prepared", "absent", "superseded"] {
             try Fixture.reset([], sessionValid: true)
-            Fixture.saved = nil; Fixture.authEmail = "me@gmail.com"; Fixture.registrationExists = true
+            Fixture.saved = nil; Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"; Fixture.registrationExists = true
             let recovery = AppModel(); await recovery.signIn()
             Fixture.failRemoteOperation = true; await recovery.beginReenrollment()
             let prepared = Fixture.operation!
@@ -913,13 +1004,13 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
                 precondition(Fixture.saved == nil && recovery.canDiscardAccountOperation && recovery.snapshot == nil)
                 precondition(Fixture.loginCalls == beforeLogin && Fixture.operation?.operationID == prepared.operationID)
                 recovery.discardPendingLocalAccount()
-                precondition(Fixture.operation == nil && recovery.reenrollmentEmail == "me@gmail.com")
+                precondition(Fixture.operation == nil && recovery.reenrollmentAccountID == "81d1a713-5b97-4257-bfb4-f094a2004296")
             }
         }
         print("PASS collected reenrollment receipt recovers only matching prepared keys; absent/superseded accounts need explicit restart")
 
         try Fixture.reset([], sessionValid: true)
-        Fixture.saved = nil; Fixture.authEmail = "me@gmail.com"; Fixture.registrationExists = true
+        Fixture.saved = nil; Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"; Fixture.registrationExists = true
         let completedRecovery = AppModel(); await completedRecovery.signIn()
         Fixture.mismatchOwnKeys = true
         await completedRecovery.beginReenrollment()
@@ -936,28 +1027,28 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
 
         for registration in ["changed", "missing", "interrupted-initial"] {
             try Fixture.reset([message(111, expiry: now() + 60)], contacts: [alice])
-            Fixture.authEmail = "me@gmail.com"
+            Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"
             Fixture.mismatchOwnKeys = registration == "changed"
             Fixture.missingOwnKeys = registration != "changed"
             if registration == "interrupted-initial" { Fixture.saved?.registered = false }
             let oldDevice = AppModel(); await oldDevice.signIn()
-            precondition(oldDevice.snapshot == nil && oldDevice.replacedDeviceEmail == "me@gmail.com")
+            precondition(oldDevice.snapshot == nil && oldDevice.replacedDeviceAccountID == "81d1a713-5b97-4257-bfb4-f094a2004296")
             precondition(Fixture.saved?.identityReplaced == true && Fixture.saved?.token == "")
             precondition(Fixture.uploads == 0 && Fixture.permissionUpdates == 0 && Fixture.sent.isEmpty && Fixture.acknowledgements == 0)
             do { try await oldDevice.updatePushToken("synthetic"); preconditionFailure("Locked identity updated push") } catch {}
             await oldDevice.refresh()
-            let lockedSend = await oldDevice.send(text: "blocked", recipient: "me@gmail.com")
+            let lockedSend = await oldDevice.send(text: "blocked", recipient: "81d1a713-5b97-4257-bfb4-f094a2004296")
             precondition(!lockedSend && Fixture.pushUpdates == 0 && Fixture.sent.isEmpty)
             let relaunch = AppModel()
-            precondition(relaunch.snapshot == nil && relaunch.replacedDeviceEmail == "me@gmail.com")
+            precondition(relaunch.snapshot == nil && relaunch.replacedDeviceAccountID == "81d1a713-5b97-4257-bfb4-f094a2004296")
             relaunch.discardReplacedDevice()
-            precondition(Fixture.saved == nil && relaunch.reenrollmentEmail == "me@gmail.com")
+            precondition(Fixture.saved == nil && relaunch.reenrollmentAccountID == "81d1a713-5b97-4257-bfb4-f094a2004296")
         }
         print("PASS stale or missing device registration never publishes renewed session or restores retired keys")
 
         let lockedDeadline = now() + 2
         try Fixture.reset([message(112, expiry: lockedDeadline)], sessionValid: true)
-        Fixture.authEmail = "me@gmail.com"; Fixture.holdAccountOperation = true
+        Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"; Fixture.holdAccountOperation = true
         let lockedDeletion = AppModel(); lockedDeletion.setAppActive(true)
         let waitingDelete = Task { await lockedDeletion.beginAccountDeletion() }
         try await waitUntil { Fixture.heldAccountOperation != nil }
@@ -987,9 +1078,9 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         let productionURL = URL(string: "https://api.isyeet.io")!
         let originalCore = Fixture.saved!.core
         Fixture.serverURL = stagingURL
-        Fixture.saved = StoredAccount(version: 1, backend: stagingURL.absoluteString, email: "me@gmail.com",
+        Fixture.saved = StoredAccount(version: 2, backend: stagingURL.absoluteString, account_id: "81d1a713-5b97-4257-bfb4-f094a2004296", username: testUsername("81d1a713-5b97-4257-bfb4-f094a2004296"),
             token: "staging token", expiresAt: Int64.max, core: originalCore, registered: true)
-        Fixture.authEmail = "me@gmail.com"; Fixture.failRemoteOperation = true
+        Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"; Fixture.failRemoteOperation = true
         let staging = AppModel(); await staging.beginAccountDeletion()
         let originalStagingAccount = Fixture.saved
         let originalStagingIntent = Fixture.operation
@@ -1010,17 +1101,17 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         print("PASS production requires separate enrollment and never adopts or deletes staging account or operation journal")
 
         try Fixture.reset([], sessionValid: true)
-        Fixture.saved = nil; Fixture.authEmail = "me@gmail.com"; Fixture.failUpload = true
+        Fixture.saved = nil; Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"; Fixture.failUpload = true
         let initialSignup = AppModel(); await initialSignup.signIn()
         precondition(Fixture.saved?.registered == false && initialSignup.snapshot?.key_maintenance.initial_upload_pending == true)
         let initialKeys = Fixture.saved!.core
         Fixture.missingOwnKeys = true; Fixture.failUpload = false
         await initialSignup.refresh()
-        precondition(initialSignup.replacedDeviceEmail == nil && Fixture.saved?.registered == true)
+        precondition(initialSignup.replacedDeviceAccountID == nil && Fixture.saved?.registered == true)
         precondition(initialSignup.snapshot?.key_maintenance.initial_upload_pending == false && Fixture.uploads == 2)
         guard case .object(let beforeKeys) = initialKeys, case .object(let afterKeys) = Fixture.saved!.core else { preconditionFailure() }
         precondition(beforeKeys["identity"] == afterKeys["identity"])
-        print("PASS original saved session retries initial upload; fresh OAuth never republishes a missing registration")
+        print("PASS original saved session retries initial upload; fresh passkey login never republishes a missing registration")
 
         for missing in [false, true] {
             try Fixture.reset([], sessionValid: true)
@@ -1030,14 +1121,14 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
             if missing {
                 precondition(migratedUpload.snapshot == nil && Fixture.saved?.identityReplaced == true)
             } else {
-                precondition(Fixture.saved?.registered == true && migratedUpload.replacedDeviceEmail == nil)
+                precondition(Fixture.saved?.registered == true && migratedUpload.replacedDeviceAccountID == nil)
             }
         }
         print("PASS migrated unregistered state validates existing keys or locks, never republishes through refresh")
 
         for response in ["network-failure", "unknown-signed-key", "matching-ack-lost"] {
             try Fixture.reset([], sessionValid: true)
-            Fixture.authEmail = "me@gmail.com"
+            Fixture.authAccountID = "81d1a713-5b97-4257-bfb4-f094a2004296"
             Fixture.failOwnKeys = response == "network-failure"
             Fixture.mismatchSignedKeys = response == "unknown-signed-key"
             if response == "matching-ack-lost" {
@@ -1048,7 +1139,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
             let renewal = AppModel(); let original = Fixture.saved
             await renewal.signIn()
             if response == "network-failure" {
-                precondition(Fixture.saved == original && renewal.replacedDeviceEmail == nil)
+                precondition(Fixture.saved == original && renewal.replacedDeviceAccountID == nil)
             } else if response == "unknown-signed-key" {
                 precondition(Fixture.saved?.identityReplaced == true && Fixture.saved?.token == "")
             } else {
@@ -1057,7 +1148,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
             }
             precondition(Fixture.uploads == 0)
         }
-        print("PASS OAuth renewal validates known registration before token adoption and resolves lost initial ACK without republishing")
+        print("PASS passkey login validates known registration before token adoption and resolves lost initial ACK without republishing")
 
         for failure in ["prepare-save", "http", "receipt", "confirm-save"] {
             try Fixture.reset([], sessionValid: true)
@@ -1104,7 +1195,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         let inboxMaintenance = try Fixture.snapshot(Fixture.saved!.core)
         Fixture.saved?.core = try Fixture.replacing(Fixture.saved!.core, snapshot: Fixture.updated(inboxMaintenance, maintenance: KeyMaintenanceState(next_check_at: 0)))
         Fixture.failMaintenance = true
-        Fixture.incoming = [QueuedMessage(id: message(126, expiry: 1).id, sender: "alice@gmail.com", envelope: "synthetic", created_at: 1)]
+        Fixture.incoming = [QueuedMessage(id: message(126, expiry: 1).id, sender: "0beaac69-d53e-48d2-b5aa-dd405b7f414d", envelope: "synthetic", created_at: 1)]
         Fixture.directArrival = message(126, expiry: now() + 60)
         let receiveBeforeMaintenance = AppModel(); await receiveBeforeMaintenance.refresh()
         precondition(Fixture.acknowledgements == 1 && receiveBeforeMaintenance.snapshot?.messages.count == 1)
@@ -1114,7 +1205,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         try Fixture.reset([], sessionValid: true)
         Fixture.selfMessages = true; Fixture.holdSend = true; Fixture.holdInbox = true
         let loopback = AppModel()
-        let selfSend = Task { await loopback.send(text: "ASCII self-test **literal**", recipient: "me@gmail.com") }
+        let selfSend = Task { await loopback.send(text: "ASCII self-test **literal**", recipient: "81d1a713-5b97-4257-bfb4-f094a2004296") }
         try await waitUntil { Fixture.heldSend != nil }
         precondition(loopback.snapshot?.outbox.count == 1 && loopback.snapshot?.messages.isEmpty == true)
         Fixture.heldSend?.resume(); Fixture.heldSend = nil
@@ -1125,7 +1216,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         Fixture.heldInbox?.resume(); Fixture.heldInbox = nil
         let selfSent = await selfSend.value
         precondition(selfSent && Fixture.acknowledgements == 1 && loopback.snapshot?.contacts.isEmpty == true)
-        precondition(loopback.snapshot?.messages.first?.sender == "me@gmail.com" && loopback.snapshot?.messages.first?.recipient == "me@gmail.com")
+        precondition(loopback.snapshot?.messages.first?.sender == "81d1a713-5b97-4257-bfb4-f094a2004296" && loopback.snapshot?.messages.first?.recipient == "81d1a713-5b97-4257-bfb4-f094a2004296")
         precondition(loopback.snapshot?.messages.first?.text == "ASCII self-test **literal**")
         precondition(loopback.unreadCount == 0 && !loopback.showsNewMessageIndicator && loopback.unreadArrivalSequence == 0)
         precondition(!loopback.checkingInbox)
@@ -1138,7 +1229,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         try Fixture.reset([], sessionValid: true)
         Fixture.selfMessages = true; Fixture.failSend = true
         let retrySelf = AppModel()
-        let queuedSelf = await retrySelf.send(text: "retry self", recipient: "me@gmail.com")
+        let queuedSelf = await retrySelf.send(text: "retry self", recipient: "81d1a713-5b97-4257-bfb4-f094a2004296")
         precondition(queuedSelf && retrySelf.snapshot?.outbox.count == 1 && retrySelf.snapshot?.messages.isEmpty == true)
         let originalSelfID = retrySelf.snapshot?.outbox.first?.id
         Fixture.failSend = false
@@ -1150,7 +1241,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         try Fixture.reset([], sessionValid: true)
         Fixture.selfMessages = true; Fixture.rejectSelfReturn = true
         let rejectedSelf = AppModel()
-        _ = await rejectedSelf.send(text: "synthetic rejected return", recipient: "me@gmail.com")
+        _ = await rejectedSelf.send(text: "synthetic rejected return", recipient: "81d1a713-5b97-4257-bfb4-f094a2004296")
         precondition(rejectedSelf.snapshot?.messages.first?.text == nil && rejectedSelf.snapshot?.messages.first?.security_alert != nil)
         precondition(rejectedSelf.unreadCount == 0 && !rejectedSelf.showsNewMessageIndicator && rejectedSelf.alert != nil)
         print("PASS rejected self return produces only a generic security alert, never received plaintext")
@@ -1159,7 +1250,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         Fixture.selfMessages = true
         let failedSelfSave = AppModel()
         Fixture.failSave = true
-        let failedSelfSend = await failedSelfSave.send(text: "unsaved self-test", recipient: "me@gmail.com")
+        let failedSelfSend = await failedSelfSave.send(text: "unsaved self-test", recipient: "81d1a713-5b97-4257-bfb4-f094a2004296")
         precondition(!failedSelfSend && Fixture.sent.isEmpty && failedSelfSave.snapshot?.messages.isEmpty == true)
         precondition(failedSelfSave.snapshot?.outbox.isEmpty == true && Fixture.acknowledgements == 0)
         print("PASS self encryption save failure cannot send or show a received message")
@@ -1167,7 +1258,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         try Fixture.reset([], sessionValid: true)
         Fixture.selfMessages = true; Fixture.holdInbox = true
         let failedReturn = AppModel()
-        let returnSend = Task { await failedReturn.send(text: "durable return test", recipient: "me@gmail.com") }
+        let returnSend = Task { await failedReturn.send(text: "durable return test", recipient: "81d1a713-5b97-4257-bfb4-f094a2004296") }
         try await waitUntil { Fixture.heldInbox != nil }
         Fixture.failSave = true
         Fixture.heldInbox?.resume(); Fixture.heldInbox = nil
@@ -1181,30 +1272,30 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
 
         try Fixture.reset([], sessionValid: true)
         let ownContact = AppModel()
-        await ownContact.addContact("m.e@gmail.com")
+        await ownContact.addContact("me_test")
         precondition(ownContact.alert == SafetyError.selfContact.errorDescription && Fixture.keyClaims == 0)
         precondition(ownContact.snapshot?.contacts.isEmpty == true)
         print("PASS adding own canonical address directs to Message yourself without directory lookup")
 
-        let groupAlice = Contact(email: "alice@gmail.com", fingerprint: String(repeating: "b", count: 64), verified: true)
-        let groupBob = Contact(email: "bob@gmail.com", fingerprint: String(repeating: "c", count: 64), verified: true)
+        let groupAlice = Contact(account_id: "0beaac69-d53e-48d2-b5aa-dd405b7f414d", username: testUsername("0beaac69-d53e-48d2-b5aa-dd405b7f414d"), fingerprint: String(repeating: "b", count: 64), verified: true)
+        let groupBob = Contact(account_id: "300db02d-b75a-4922-8759-f08a0efa5a40", username: testUsername("300db02d-b75a-4922-8759-f08a0efa5a40"), fingerprint: String(repeating: "c", count: 64), verified: true)
         let testGroup = MessageGroup(id: String(repeating: "1", count: 64), title: "Test group",
-                                    members: [.init(email: "me@gmail.com", fingerprint: String(repeating: "a", count: 64)),
-                                              .init(email: groupAlice.email, fingerprint: groupAlice.fingerprint),
-                                              .init(email: groupBob.email, fingerprint: groupBob.fingerprint)], blocked: false)
+                                    members: [.init(account_id: "81d1a713-5b97-4257-bfb4-f094a2004296", fingerprint: String(repeating: "a", count: 64)),
+                                              .init(account_id: groupAlice.account_id, fingerprint: groupAlice.fingerprint),
+                                              .init(account_id: groupBob.account_id, fingerprint: groupBob.fingerprint)], blocked: false)
         try Fixture.reset([], sessionValid: true, contacts: [groupAlice, groupBob])
         let fanout = AppModel()
         Fixture.failSave = true
-        let failedCreation = await fanout.createGroup(title: "Test group", members: [groupAlice.email, groupBob.email])
+        let failedCreation = await fanout.createGroup(title: "Test group", members: [groupAlice.account_id, groupBob.account_id])
         precondition(failedCreation == nil && fanout.snapshot?.groups.isEmpty == true)
         Fixture.failSave = false
-        let createdGroup = await fanout.createGroup(title: "Test group", members: [groupAlice.email, groupBob.email])
+        let createdGroup = await fanout.createGroup(title: "Test group", members: [groupAlice.account_id, groupBob.account_id])
         precondition(createdGroup == testGroup.id && fanout.snapshot?.groups.first == testGroup)
         Fixture.failSave = true
         let failedFanout = await fanout.sendGroup(text: "never leave unsaved state", groupID: testGroup.id)
         precondition(!failedFanout && Fixture.sent.isEmpty && fanout.snapshot?.messages.isEmpty == true && fanout.snapshot?.outbox.isEmpty == true)
         Fixture.failSave = false
-        Fixture.failedRecipients = [groupBob.email]
+        Fixture.failedRecipients = [groupBob.account_id]
         let acceptedLocally = await fanout.sendGroup(text: "two encrypted recipients", groupID: testGroup.id)
         precondition(acceptedLocally && Fixture.sent.count == 2 && fanout.snapshot?.outbox.count == 1)
         precondition(fanout.snapshot?.messages.first?.status == "partially_accepted" && fanout.snapshot?.messages.first?.accepted_count == 1)
@@ -1217,32 +1308,32 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         print("PASS group creation/fanout save atomically before send and independent relay acceptance retries")
 
         let groupHistory = fanout.snapshot!.messages[0]
-        let otherLeg = SendRequest(id: "00000000-0000-4000-8000-000000000501", recipient: groupBob.email,
+        let otherLeg = SendRequest(id: "00000000-0000-4000-8000-000000000501", recipient: groupBob.account_id,
                                    envelope: "synthetic remaining leg", expires_at: now() + 60)
         let otherRef = OutboxReference(id: otherLeg.id, group_id: testGroup.id, message_id: groupHistory.id, recipient: otherLeg.recipient)
         try Fixture.reset([groupHistory], outbox: [otherLeg], sessionValid: true, contacts: [groupAlice, groupBob], groups: [testGroup], refs: [otherRef])
-        Fixture.saved!.contactIdentityChanges = [groupAlice.email]
+        Fixture.saved!.contactIdentityChanges = [groupAlice.account_id]
         let warnedGroup = AppModel()
         precondition(warnedGroup.groupIsBlocked(testGroup.id) && warnedGroup.snapshot?.groups.first?.blocked == true)
         precondition(warnedGroup.snapshot?.outbox.isEmpty == true)
         await warnedGroup.refresh()
         let blockedFanout = await warnedGroup.sendGroup(text: "blocked", groupID: testGroup.id)
-        let blockedCreation = await warnedGroup.createGroup(title: "Not allowed", members: [groupAlice.email, groupBob.email])
+        let blockedCreation = await warnedGroup.createGroup(title: "Not allowed", members: [groupAlice.account_id, groupBob.account_id])
         precondition(!blockedFanout && blockedCreation == nil && Fixture.sent.isEmpty)
         print("PASS one member warning cancels every group leg including other recipients and blocks creation")
 
-        let pendingGroupMessage = StoredMessage(id: "00000000-0000-4000-8000-000000000510", sender: groupAlice.email,
-                                               recipient: "me@gmail.com", text: "hidden pending verification", security_alert: nil,
+        let pendingGroupMessage = StoredMessage(id: "00000000-0000-4000-8000-000000000510", sender: groupAlice.account_id,
+                                               recipient: "81d1a713-5b97-4257-bfb4-f094a2004296", text: "hidden pending verification", security_alert: nil,
                                                duplicate: false, expires_at: now() + 60, group_id: testGroup.id,
                                                received_at: now() - 3, status: "received")
         try Fixture.reset([], sessionValid: true, contacts: [groupAlice, groupBob])
         Fixture.resolutionGroup = testGroup; Fixture.allowResolve = true
         guard case var .object(warningCore) = Fixture.saved!.core else { fatalError() }
         warningCore["pending_resolutions"] = try Fixture.json([pendingGroupMessage])
-        Fixture.saved!.core = .object(warningCore); Fixture.saved!.contactIdentityChanges = [groupBob.email]
+        Fixture.saved!.core = .object(warningCore); Fixture.saved!.contactIdentityChanges = [groupBob.account_id]
         let warnedUnknownGroup = AppModel()
         precondition(warnedUnknownGroup.snapshot?.messages.isEmpty == true && warnedUnknownGroup.snapshot?.groups.isEmpty == true)
-        precondition(warnedUnknownGroup.snapshot?.pending_group_senders == [groupAlice.email])
+        precondition(warnedUnknownGroup.snapshot?.pending_group_senders == [groupAlice.account_id])
         warnedUnknownGroup.maintainLocalMessages()
         precondition(warnedUnknownGroup.snapshot?.messages.isEmpty == true && warnedUnknownGroup.unreadCount == 0)
         print("PASS warning migration precedes unknown-group quarantine promotion from a different sender")
@@ -1265,7 +1356,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         let detailArrival = try Fixture.changedMessage(pendingGroupMessage, ["expires_at": .integer(detailsDeadline)])
         try Fixture.reset([], sessionValid: true, contacts: [groupAlice, groupBob])
         Fixture.resolutionGroup = testGroup; Fixture.deferredArrival = detailArrival
-        Fixture.incoming = [QueuedMessage(id: detailArrival.id, sender: groupAlice.email, envelope: "synthetic deferred group", created_at: now())]
+        Fixture.incoming = [QueuedMessage(id: detailArrival.id, sender: groupAlice.account_id, envelope: "synthetic deferred group", created_at: now())]
         let coveredGroup = AppModel(); coveredGroup.setAppActive(true)
         coveredGroup.conversationDidAppear(testGroup.conversationID)
         coveredGroup.setPresentationCovered("message-details", covered: true)
@@ -1289,7 +1380,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
 
         try Fixture.reset([], sessionValid: true, contacts: [groupAlice, groupBob])
         Fixture.resolutionGroup = testGroup; Fixture.deferredArrival = pendingGroupMessage
-        Fixture.incoming = [QueuedMessage(id: pendingGroupMessage.id, sender: groupAlice.email, envelope: "synthetic pending group", created_at: now())]
+        Fixture.incoming = [QueuedMessage(id: pendingGroupMessage.id, sender: groupAlice.account_id, envelope: "synthetic pending group", created_at: now())]
         let failedQuarantine = AppModel(); Fixture.failSave = true
         await failedQuarantine.refresh()
         precondition(Fixture.acknowledgements == 0 && failedQuarantine.snapshot?.messages.isEmpty == true)
@@ -1377,7 +1468,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         oldConfirmation.setAppActive(false)
         print("PASS stale policy response across background/resume cannot authorize a fresh foreground session")
 
-        let availableRecipient = SendRequest(id: "00000000-0000-4000-8000-000000000803", recipient: "bob@gmail.com", envelope: "synthetic second recipient", expires_at: now() + 60)
+        let availableRecipient = SendRequest(id: "00000000-0000-4000-8000-000000000803", recipient: "300db02d-b75a-4922-8759-f08a0efa5a40", envelope: "synthetic second recipient", expires_at: now() + 60)
         try Fixture.reset([], outbox: [firstReal, availableRecipient], sessionValid: true, traffic: coverTraffic)
         Fixture.remoteCover = true; Fixture.failedRecipients = [firstReal.recipient]
         let fairSlots = AppModel(); fairSlots.setAppActive(true)
@@ -1415,7 +1506,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         try Fixture.reset([], sessionValid: true, traffic: coverTraffic)
         Fixture.remoteCover = true; Fixture.selfMessages = true
         let coverSelf = AppModel(); coverSelf.setAppActive(true)
-        let selfQueued = await coverSelf.send(text: "Synthetic scheduled self test", recipient: "me@gmail.com")
+        let selfQueued = await coverSelf.send(text: "Synthetic scheduled self test", recipient: "81d1a713-5b97-4257-bfb4-f094a2004296")
         precondition(selfQueued && Fixture.sent.isEmpty && coverSelf.snapshot?.messages.isEmpty == true)
         await coverSelf.sendCoverSlot()
         precondition(Fixture.sent.count == 1 && coverSelf.snapshot?.messages.isEmpty == true)
@@ -1424,7 +1515,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         coverSelf.setAppActive(false)
         print("PASS self test waits for a cover slot and authentic relay return before display")
 
-        coverTraffic.eligible_contacts = [groupAlice.email]
+        coverTraffic.eligible_contacts = [groupAlice.account_id]
         try Fixture.reset([], sessionValid: true, contacts: [groupAlice, groupBob], groups: [testGroup], traffic: coverTraffic)
         Fixture.remoteCover = true
         let slottedGroup = AppModel(); slottedGroup.setAppActive(true)
@@ -1447,7 +1538,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         slottedGroup.setAppActive(false)
         print("PASS atomic group fanout uses one slot per recipient and real queued legs take priority over a saved cover")
 
-        coverTraffic.eligible_contacts = [groupAlice.email]
+        coverTraffic.eligible_contacts = [groupAlice.account_id]
         try Fixture.reset([], sessionValid: true, contacts: [groupAlice], traffic: coverTraffic)
         Fixture.remoteCover = true
         let covers = AppModel(); covers.setAppActive(true)
@@ -1474,7 +1565,7 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
 
         try Fixture.reset([], sessionValid: true)
         Fixture.coverArrives = true
-        Fixture.incoming = [QueuedMessage(id: message(802, expiry: now() + 60).id, sender: "alice@gmail.com", envelope: "synthetic cover", created_at: now())]
+        Fixture.incoming = [QueuedMessage(id: message(802, expiry: now() + 60).id, sender: "0beaac69-d53e-48d2-b5aa-dd405b7f414d", envelope: "synthetic cover", created_at: now())]
         let coverReceiver = AppModel()
         Fixture.failSave = true
         await coverReceiver.refresh(quiet: true)
@@ -1484,5 +1575,115 @@ enum CoreError: Error, LocalizedError { case coverClockUnavailable, coverUnavail
         precondition(Fixture.acknowledgements == 1 && coverReceiver.unreadCount == 0)
         precondition(coverReceiver.snapshot?.messages.isEmpty == true && !coverReceiver.showsNewMessageIndicator && coverReceiver.alert == nil)
         print("PASS authenticated covers persist before ACK with no history, unread count or human alert")
+        #endif
+    }
+}
+
+// This adapter tests native persistence/network order only. Rust tests verify
+// the signatures, canonical transcript, real expiry, and allocation rules.
+extension CryptoBridge {
+    private func deviceCall(_ operation: String, state: JSONValue, fields: [String: JSONValue]) throws -> CoreResult {
+        guard case var .object(object) = state else { throw CoreError.rejected }
+        var view: [String: JSONValue]
+        if case .object(let stored) = object["device_authority_state"] { view = stored }
+        else { view = ["authority": .null, "pending": .null, "approval_code": .null, "messaging_available": .bool(false)] }
+        switch operation {
+        case "device_authority_observe":
+            let remote = fields["authority"] ?? .null
+            if case .object(let signed) = view["pending"], case .object(let change) = signed["change"] {
+                if remote != .null, remote == change["roster"] {
+                    view["authority"] = remote; view["pending"] = .null
+                    view["approval_code"] = .string("ISYEET-APPROVAL-1:" + Data("synthetic public approval".utf8).base64URL)
+                } else if Fixture.devicePendingExpired && remote == view["authority"] {
+                    view["pending"] = .null
+                    object["burned_device_version"] = .integer(1)
+                }
+            }
+            view["authority"] = remote
+        case "device_authority_prepare":
+            guard view["pending"] == .null else { throw CoreError.rejected }
+            let identity = try Fixture.snapshot(state)
+            let now = Int64(Date().timeIntervalSince1970)
+            let certificate: JSONValue = .object(["account_id": .string(identity.account_id), "root_epoch": .string("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+                "device_id": .integer(1), "identity_key": .string("synthetic"), "registration_id": .integer(1), "label": .string("Primary phone"), "request_hash": .string(String(repeating: "0", count: 64))])
+            let roster: JSONValue = .object(["signature": .string("synthetic"), "roster": .object([
+                "origin": fields["origin"]!, "account_id": .string(identity.account_id), "root_epoch": .string("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+                "root_identity_key": .string("synthetic"), "version": .integer(1), "previous_hash": .string(String(repeating: "0", count: 64)),
+                "highest_device_id": .integer(1), "issued_at": .integer(now), "expires_at": .integer(now + 86_400),
+                "devices": .array([.object(["certificate": certificate, "signature": .string("synthetic")])])])])
+            view["pending"] = .object(["signature": .string("synthetic"), "change": .object([
+                "operation_id": .string(UUID().uuidString.lowercased()), "roster": roster, "expires_at": .integer(now + 300)])])
+            view["approval_code"] = .null
+            object["burned_device_version"] = .integer(1)
+        case "device_authority_commit":
+            guard case .object(let signed) = view["pending"], case .object(let change) = signed["change"] else { throw CoreError.rejected }
+            view["authority"] = change["roster"]; view["pending"] = .null
+            view["approval_code"] = .string("ISYEET-APPROVAL-1:" + Data("synthetic public approval".utf8).base64URL)
+        default: throw CoreError.rejected
+        }
+        object["device_authority_state"] = .object(view)
+        return CoreResult(state: .object(object), data: .object(view))
+    }
+}
+
+extension LifecycleChecks {
+    @MainActor private static func runDeviceAuthorizationChecks() async throws {
+        let accountID = "81d1a713-5b97-4257-bfb4-f094a2004296"
+        func pending() -> JSONValue? {
+            guard case .object(let root) = Fixture.saved?.core, case .object(let view) = root["device_authority_state"] else { return nil }
+            return view["pending"] == .null ? nil : view["pending"]
+        }
+        func setup() throws -> AppModel {
+            try Fixture.reset([], sessionValid: true)
+            Fixture.resetDeviceAuthorization()
+            Fixture.authAccountID = accountID
+            return AppModel()
+        }
+
+        let failedSave = try setup()
+        await failedSave.refreshMessagingDevices()
+        let durableBefore = Fixture.saved
+        Fixture.failSave = true
+        await failedSave.prepareMessagingDeviceAuthority()
+        precondition(Fixture.saved == durableBefore && pending() == nil)
+        precondition(Fixture.deviceMutationCalls.isEmpty && Fixture.deviceProofs == 0)
+        Fixture.failSave = false
+        print("PASS proposal persistence failure prevents passkey proof, publication and UI adoption")
+
+        let lostReply = try setup()
+        Fixture.deviceLoseReceipt = true
+        await lostReply.prepareMessagingDeviceAuthority()
+        precondition(Fixture.deviceMutationCalls.count == 1 && Fixture.deviceProofs == 1)
+        let exactChange = Fixture.deviceMutationCalls[0]
+        precondition(pending() == exactChange && lostReply.deviceAuthority?.approval_code == nil)
+        let relaunched = AppModel()
+        await relaunched.refreshMessagingDevices()
+        precondition(pending() == nil && relaunched.deviceAuthority?.pending == nil && relaunched.deviceAuthority?.approval_code != nil)
+        precondition(Fixture.deviceMutationCalls == [exactChange] && Fixture.deviceProofs == 1)
+        print("PASS crash after server success with receipt lost reconciles exact signed roster without republishing")
+
+        let expired = try setup()
+        Fixture.deviceRejectMutation = true
+        await expired.prepareMessagingDeviceAuthority()
+        precondition(pending() != nil && Fixture.deviceRemoteAuthority == nil)
+        Fixture.devicePendingExpired = true
+        let expiredRelaunch = AppModel()
+        await expiredRelaunch.refreshMessagingDevices()
+        precondition(pending() == nil && expiredRelaunch.deviceAuthority?.approval_code == nil)
+        guard case .object(let durable) = Fixture.saved?.core else { preconditionFailure() }
+        precondition(durable["burned_device_version"] == .integer(1))
+        precondition(Fixture.deviceMutationCalls.count == 1)
+        print("PASS expired unpublished proposal clears only through observation and retains burned allocation state")
+
+        let cancelled = try setup()
+        Fixture.authAccountID = nil
+        await cancelled.prepareMessagingDeviceAuthority()
+        guard let cancelledExact = pending() else { preconditionFailure() }
+        precondition(Fixture.deviceMutationCalls.isEmpty && cancelled.deviceAuthority?.approval_code == nil)
+        Fixture.authAccountID = accountID
+        await cancelled.resumeDeviceAuthorization()
+        precondition(Fixture.deviceMutationCalls == [cancelledExact] && pending() == nil)
+        print("PASS cancelled passkey proof preserves signed proposal and resumes identical change")
+        Fixture.deviceNetworkEnabled = false
     }
 }

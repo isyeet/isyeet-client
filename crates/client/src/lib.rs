@@ -1,11 +1,17 @@
 //! Minimal shared Signal client. Every operation proposes a complete new state;
 //! callers must persist it atomically before releasing ciphertext or acknowledging.
 mod contacts;
+#[cfg(feature = "device-linking")]
+mod device_authority;
 mod groups;
 mod maintenance;
 mod store;
 mod traffic;
 use anyhow::{Result, bail, ensure};
+#[cfg(feature = "device-linking")]
+pub use device_authority::{
+    DeviceCandidate, verify_device_change, verify_device_link, verify_device_roster,
+};
 pub use groups::{Group, GroupMember, OutboxRef};
 use isyeet_wire::*;
 use libsignal_protocol::*;
@@ -30,7 +36,9 @@ pub struct State {
     version: u32,
     #[serde(default)]
     traffic: traffic::TrafficState,
-    pub email: String,
+    pub account_id: String,
+    pub username: String,
+    contact_usernames: std::collections::BTreeMap<String, String>,
     identities: Identities,
     sessions: Sessions,
     prekeys: PreKeys,
@@ -61,6 +69,14 @@ pub struct State {
     removed_contacts: Vec<contacts::RemovedContact>,
     #[serde(default)]
     key_maintenance: maintenance::KeyMaintenanceState,
+    #[cfg(feature = "device-linking")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_authority: Option<device_authority::DeviceAuthorityState>,
+    // Default builds preserve experimental allocation watermarks losslessly,
+    // but cannot interpret them or expose any authority operation.
+    #[cfg(not(feature = "device-linking"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_authority: Option<Value>,
 }
 
 /// Two distinct Signal endpoints for the same local identity. Their session and
@@ -75,7 +91,7 @@ struct SelfChannel {
 }
 
 impl SelfChannel {
-    async fn initialize(email: &str, identities: &mut Identities) -> Result<Self> {
+    async fn initialize(account_id: &str, identities: &mut Identities) -> Result<Self> {
         let identity = identities.get_identity_key_pair().await?;
         let mut rng = rand::rngs::OsRng.unwrap_err();
         let one_time = KeyPair::generate(&mut rng);
@@ -121,8 +137,8 @@ impl SelfChannel {
             .save_kyber_pre_key(1.into(), &kyber_record)
             .await?;
         process_prekey_bundle(
-            &address(email),
-            &address(email),
+            &address(account_id),
+            &address(account_id),
             &mut channel.outgoing,
             identities,
             &bundle,
@@ -139,8 +155,8 @@ impl SelfChannel {
         const ACK: &[u8] = b"ISYEET local self-session setup acknowledgment v1";
         let hello = message_encrypt(
             HELLO,
-            &address(email),
-            &address(email),
+            &address(account_id),
+            &address(account_id),
             &mut channel.outgoing,
             identities,
             SystemTime::now(),
@@ -149,8 +165,8 @@ impl SelfChannel {
         .await?;
         let received = message_decrypt(
             &hello,
-            &address(email),
-            &address(email),
+            &address(account_id),
+            &address(account_id),
             &mut channel.incoming,
             identities,
             &mut channel.prekeys,
@@ -162,8 +178,8 @@ impl SelfChannel {
         ensure!(received == HELLO, SECURITY_ALERT);
         let reply = message_encrypt(
             ACK,
-            &address(email),
-            &address(email),
+            &address(account_id),
+            &address(account_id),
             &mut channel.incoming,
             identities,
             SystemTime::now(),
@@ -172,8 +188,8 @@ impl SelfChannel {
         .await?;
         let received = message_decrypt(
             &reply,
-            &address(email),
-            &address(email),
+            &address(account_id),
+            &address(account_id),
             &mut channel.outgoing,
             identities,
             &mut channel.prekeys,
@@ -299,9 +315,9 @@ fn unframe(bytes: &[u8], current: i64) -> Result<DecodedFrame> {
         expires_at,
     })
 }
-fn address(email: &str) -> ProtocolAddress {
+fn address(account_id: &str) -> ProtocolAddress {
     ProtocolAddress::new(
-        email.to_owned(),
+        account_id.to_owned(),
         DeviceId::new(1).expect("constant device ID"),
     )
 }
@@ -312,12 +328,13 @@ fn fingerprint(identity: &str) -> Result<String> {
         .collect())
 }
 fn normalized(input: &str) -> Result<String> {
-    canonical_email(input).map_err(anyhow::Error::msg)
+    canonical_account_id(input).map_err(anyhow::Error::msg)
 }
 
 impl State {
-    pub async fn initialize(email: &str) -> Result<Self> {
-        let email = normalized(email)?;
+    pub async fn initialize(account_id: &str, username: &str) -> Result<Self> {
+        let account_id = normalized(account_id)?;
+        let username = canonical_username(username).map_err(anyhow::Error::msg)?;
         let mut rng = rand::rngs::OsRng.unwrap_err();
         let identity = IdentityKeyPair::generate(&mut rng);
         let registration = rng.random_range(1..16380);
@@ -364,9 +381,11 @@ impl State {
         let mut kyber = KyberPreKeys::default();
         kyber.save_kyber_pre_key(1.into(), &kyber_record).await?;
         Ok(Self {
-            version: 6,
+            version: 7,
             traffic: Default::default(),
-            email,
+            account_id,
+            username,
+            contact_usernames: Default::default(),
             identities: Identities {
                 pair: encode(identity.serialize()),
                 registration,
@@ -391,6 +410,7 @@ impl State {
             group_identity_warnings: Default::default(),
             removed_contacts: Default::default(),
             key_maintenance: maintenance::KeyMaintenanceState::new(current_time()?),
+            device_authority: None,
         })
     }
     /// Propose deletion of expired message material, preserving all crypto state.
@@ -402,10 +422,8 @@ impl State {
         self.expire_at_with_resolution(observed, true)
     }
     fn expire_at_with_resolution(&mut self, observed: i64, resolve: bool) -> Result<bool> {
-        ensure!(
-            observed > 0 && matches!(self.version, 1..=6),
-            "Invalid state or clock."
-        );
+        ensure!(observed > 0, "Invalid state or clock.");
+        self.validate_identity_schema()?;
         let current = observed.max(self.last_observed_at);
         let before = (
             self.outbox.len(),
@@ -418,20 +436,6 @@ impl State {
             self.deferred_groups.len(),
             self.groups.len(),
         );
-        if self.version == 1 {
-            // Undated text and pending ciphertext cannot establish a send-time
-            // deadline. Never grant them a new message lifetime on upgrade.
-            // Retain only content-free ACK dedupe for one fixed migration week.
-            let until = deadline(current)?;
-            for entry in &mut self.received {
-                if let ReceivedRecord::Legacy(key) = entry {
-                    *entry = ReceivedRecord::Dated {
-                        key: key.clone(),
-                        expires_at: until,
-                    };
-                }
-            }
-        }
         self.outbox
             .retain(|m| m.expires_at > current && valid_deadline(m.expires_at, current));
         self.messages.retain(|m| {
@@ -451,7 +455,7 @@ impl State {
         let removed_changed = self.prune_removed_contacts(current);
         let traffic_changed = self.prune_traffic(current);
         let keys_changed = self.prune_key_material(current)?;
-        self.version = 6;
+        self.version = 7;
         self.last_observed_at = current;
         Ok(keys_changed
             || traffic_changed
@@ -480,8 +484,64 @@ impl State {
     pub fn verified_contacts(&self) -> Vec<String> {
         self.verified.iter().cloned().collect()
     }
-    pub fn has_contact(&self, email: &str) -> bool {
-        self.identities.known.contains_key(email)
+    pub fn has_contact(&self, account_id: &str) -> bool {
+        self.identities.known.contains_key(account_id)
+    }
+    /// The username protocol is a deliberate clean break. Never relabel an old
+    /// Signal address or keep an email-addressed store inside a v7 envelope.
+    pub fn validate_identity_schema(&self) -> Result<()> {
+        let valid_id = |id: &String| canonical_account_id(id).as_ref() == Ok(id);
+        ensure!(
+            self.version == 7
+                && valid_id(&self.account_id)
+                && canonical_username(&self.username).as_ref() == Ok(&self.username)
+                && self.identities.known.keys().all(valid_id)
+                && self.sessions.0.keys().all(valid_id)
+                && self.verified.iter().all(valid_id)
+                && self.contact_usernames.iter().all(|(id, name)| valid_id(id)
+                    && self.has_contact(id)
+                    && canonical_username(name).as_ref() == Ok(name))
+                && self.group_identity_warnings.keys().all(valid_id)
+                && self
+                    .groups
+                    .values()
+                    .all(|g| g.members.iter().all(|m| valid_id(&m.account_id)))
+                && self.outbox.iter().all(|m| valid_id(&m.recipient))
+                && self
+                    .messages
+                    .iter()
+                    .all(|m| valid_id(&m.sender) && valid_id(&m.recipient))
+                && self.deferred_groups.iter().all(|m| valid_id(&m.sender)),
+            "Invalid or unsupported identity state; explicit enrollment is required."
+        );
+        Ok(())
+    }
+    /// Resolve only locally pinned identity metadata. Sending must never consult
+    /// the directory again and silently redirect an existing contact's name.
+    pub fn contact_id(&self, input: &str) -> Result<String> {
+        if let Ok(account_id) = canonical_account_id(input) {
+            ensure!(
+                account_id == self.account_id || self.has_contact(&account_id),
+                "Add the contact first."
+            );
+            return Ok(account_id);
+        }
+        let username = canonical_username(input.strip_prefix('@').unwrap_or(input))
+            .map_err(anyhow::Error::msg)?;
+        let mut matches = self
+            .contact_usernames
+            .iter()
+            .filter(|(id, name)| *name == &username && self.has_contact(id))
+            .map(|(id, _)| id.clone())
+            .chain((self.username == username).then(|| self.account_id.clone()));
+        let account_id = matches
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Add the contact first."))?;
+        ensure!(
+            matches.next().is_none(),
+            "Ambiguous contact username; use its verified account ID."
+        );
+        Ok(account_id)
     }
     pub fn snapshot(&self) -> Result<Value> {
         let mut pruned = self.clone();
@@ -489,21 +549,39 @@ impl State {
         pruned.snapshot_pruned()
     }
     fn snapshot_pruned(&self) -> Result<Value> {
-        let contacts: Result<Vec<Value>> = self.identities.known.iter().map(|(email, key)| Ok(json!({"email":email,"fingerprint":fingerprint(key)?,"verified":self.verified.contains(email)}))).collect();
+        let contacts: Result<Vec<Value>> = self.identities.known.iter().map(|(account_id, key)| Ok(json!({"account_id":account_id,"username":self.contact_usernames.get(account_id),"fingerprint":fingerprint(key)?,"verified":self.verified.contains(account_id)}))).collect();
         Ok(
-            json!({"email":self.email,"fingerprint":fingerprint(&self.upload.identity_key)?,"contacts":contacts?,"outbox":self.outbox,"messages":self.messages,"groups":self.groups.values().collect::<Vec<_>>(),"outbox_refs":self.group_outbox.values().collect::<Vec<_>>(),"pending_group_senders":self.deferred_groups.iter().map(|entry| &entry.sender).collect::<BTreeSet<_>>(),"resolved_message_ids":self.resolved_message_ids,"next_expiry":self.next_expiry(),"traffic":self.traffic_snapshot(),"key_maintenance":self.key_maintenance_snapshot()}),
+            json!({"account_id":self.account_id,"username":self.username,"fingerprint":fingerprint(&self.upload.identity_key)?,"contacts":contacts?,"outbox":self.outbox,"messages":self.messages,"groups":self.groups.values().collect::<Vec<_>>(),"outbox_refs":self.group_outbox.values().collect::<Vec<_>>(),"pending_group_senders":self.deferred_groups.iter().map(|entry| &entry.sender).collect::<BTreeSet<_>>(),"resolved_message_ids":self.resolved_message_ids,"next_expiry":self.next_expiry(),"traffic":self.traffic_snapshot(),"key_maintenance":self.key_maintenance_snapshot()}),
         )
     }
     pub async fn add_contact(&mut self, bundle: KeyBundle) -> Result<Value> {
         self.expire()?;
-        let email = normalized(&bundle.email)?;
-        ensure!(email != self.email, "Cannot add your own account.");
+        let account_id = normalized(&bundle.account_id)?;
+        let username = canonical_username(&bundle.username).map_err(anyhow::Error::msg)?;
+        ensure!(
+            self.contact_usernames
+                .get(&account_id)
+                .is_none_or(|known| known == &username),
+            "Contact username changed; rejected."
+        );
+        ensure!(
+            username != self.username
+                && self
+                    .contact_usernames
+                    .iter()
+                    .all(|(id, name)| id == &account_id || name != &username),
+            "Contact username points to a different account; rejected."
+        );
+        ensure!(
+            account_id != self.account_id,
+            "Cannot add your own account."
+        );
         let key = IdentityKey::decode(&decode(&bundle.identity_key)?)?;
         ensure!(
-            !self.removed_pin(&email, &fingerprint(&bundle.identity_key)?),
+            !self.removed_pin(&account_id, &fingerprint(&bundle.identity_key)?),
             "contact_identity_removed"
         );
-        let addr = address(&email);
+        let addr = address(&account_id);
         ensure!(
             self.identities
                 .is_trusted_identity(&addr, &key, Direction::Sending)
@@ -511,7 +589,7 @@ impl State {
             "Contact identity changed; rejected."
         );
         // Preserve a live ratchet for an already-known identity. Re-claim must not reset it.
-        if !self.sessions.0.contains_key(&email) {
+        if !self.sessions.0.contains_key(&account_id) {
             let prekey = bundle
                 .pre_key
                 .as_ref()
@@ -536,7 +614,7 @@ impl State {
             )?;
             process_prekey_bundle(
                 &addr,
-                &address(&self.email),
+                &address(&self.account_id),
                 &mut self.sessions,
                 &mut self.identities,
                 &prekey_bundle,
@@ -545,21 +623,23 @@ impl State {
             )
             .await?;
         }
+        self.contact_usernames
+            .insert(account_id.clone(), username.clone());
         Ok(
-            json!({"email":email,"fingerprint":fingerprint(&bundle.identity_key)?,"verified":self.verified.contains(&email)}),
+            json!({"account_id":account_id,"username":username,"fingerprint":fingerprint(&bundle.identity_key)?,"verified":self.verified.contains(&account_id)}),
         )
     }
-    pub fn verify_contact(&mut self, email: &str, expected: &str) -> Result<Value> {
+    pub fn verify_contact(&mut self, account_id: &str, expected: &str) -> Result<Value> {
         self.expire()?;
-        let email = normalized(email)?;
+        let account_id = normalized(account_id)?;
         let key = self
             .identities
             .known
-            .get(&email)
+            .get(&account_id)
             .ok_or_else(|| anyhow::anyhow!("Add the contact first."))?;
         let actual = fingerprint(key)?;
         ensure!(
-            !self.removed_pin(&email, &actual),
+            !self.removed_pin(&account_id, &actual),
             "contact_identity_removed"
         );
         ensure!(
@@ -568,24 +648,28 @@ impl State {
                 && actual == expected.to_ascii_lowercase(),
             "Fingerprint mismatch; contact remains blocked."
         );
-        self.verified.insert(email.clone());
-        self.verified_readded_contact(&email, &actual);
+        self.verified.insert(account_id.clone());
+        self.verified_readded_contact(&account_id, &actual);
         self.resolve_deferred_groups(self.last_observed_at)?;
-        Ok(json!({"email":email,"fingerprint":actual,"verified":true}))
+        Ok(
+            json!({"account_id":account_id,"username":self.contact_usernames.get(&account_id),"fingerprint":actual,"verified":true}),
+        )
     }
     /// Explicitly replace one peer after independently verifying its new key.
     /// Validate on a clone: even a late Signal signature failure must leave the
     /// caller's original pin, session, verification and pending messages intact.
     pub async fn replace_contact(
         &mut self,
-        email: &str,
+        account_id: &str,
         bundle: KeyBundle,
         previous_fingerprint: &str,
         expected_fingerprint: &str,
     ) -> Result<Value> {
         let replacement = async {
-            let target = normalized(email)?;
-            ensure!(target == email && bundle.email == target && target != self.email);
+            let target = normalized(account_id)?;
+            ensure!(
+                target == account_id && bundle.account_id == target && target != self.account_id
+            );
             let old_key = self
                 .identities
                 .known
@@ -630,7 +714,7 @@ impl State {
         self.expire_at(observed)?;
         let expires_at = deadline(self.last_observed_at)?;
         let recipient = normalized(recipient)?;
-        let is_self = recipient == self.email;
+        let is_self = recipient == self.account_id;
         ensure!(
             is_self || self.verified.contains(&recipient),
             "contact_verification_required"
@@ -646,7 +730,7 @@ impl State {
         if !is_self {
             self.record(LocalMessage {
                 id: message.id.clone(),
-                sender: self.email.clone(),
+                sender: self.account_id.clone(),
                 recipient,
                 text: Some(text.to_owned()),
                 security_alert: None,
@@ -676,17 +760,17 @@ impl State {
         let mut framed = plaintext.to_vec();
         self.write_traffic_trailer(recipient, &mut framed, expires_at);
         let plaintext = framed.as_slice();
-        let is_self = recipient == self.email;
+        let is_self = recipient == self.account_id;
         let (ciphertext, self_channel) = if is_self {
             let mut identities = self.self_identities().await?;
             let mut channel = match &self.self_channel {
                 Some(channel) => channel.clone(),
-                None => SelfChannel::initialize(&self.email, &mut identities).await?,
+                None => SelfChannel::initialize(&self.account_id, &mut identities).await?,
             };
             let ciphertext = message_encrypt(
                 plaintext,
-                &address(&self.email),
-                &address(&self.email),
+                &address(&self.account_id),
+                &address(&self.account_id),
                 &mut channel.outgoing,
                 &mut identities,
                 SystemTime::now(),
@@ -699,7 +783,7 @@ impl State {
                 message_encrypt(
                     plaintext,
                     &address(recipient),
-                    &address(&self.email),
+                    &address(&self.account_id),
                     &mut self.sessions,
                     &mut self.identities,
                     SystemTime::now(),
@@ -773,7 +857,7 @@ impl State {
             pair: self.identities.pair.clone(),
             registration: self.identities.registration,
             known: [(
-                self.email.clone(),
+                self.account_id.clone(),
                 encode(identity.identity_key().serialize()),
             )]
             .into(),
@@ -797,7 +881,7 @@ impl State {
             3 => CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(serialized)?),
             _ => bail!(SECURITY_ALERT),
         };
-        if sender == self.email {
+        if sender == self.account_id {
             let mut identities = self.self_identities().await?;
             let channel = self
                 .self_channel
@@ -806,7 +890,7 @@ impl State {
             return Ok(message_decrypt(
                 &ciphertext,
                 &address(sender),
-                &address(&self.email),
+                &address(&self.account_id),
                 &mut channel.incoming,
                 &mut identities,
                 &mut channel.prekeys,
@@ -819,7 +903,7 @@ impl State {
         Ok(message_decrypt(
             &ciphertext,
             &address(sender),
-            &address(&self.email),
+            &address(&self.account_id),
             &mut self.sessions,
             &mut self.identities,
             &mut self.prekeys,
@@ -849,7 +933,7 @@ impl State {
             return Ok(LocalMessage {
                 id: message.id,
                 sender,
-                recipient: self.email.clone(),
+                recipient: self.account_id.clone(),
                 text: None,
                 security_alert: None,
                 duplicate: true,
@@ -869,7 +953,7 @@ impl State {
         }
         let removed_delivery = self.removed_delivery(&sender, &message.envelope);
         ensure!(
-            removed_delivery || sender == self.email || self.verified.contains(&sender),
+            removed_delivery || sender == self.account_id || self.verified.contains(&sender),
             "contact_verification_required"
         );
         // Authentication failure may have called stores: roll it back. Successful
@@ -902,7 +986,7 @@ impl State {
                 LocalMessage {
                     id: message.id.clone(),
                     sender: sender.clone(),
-                    recipient: self.email.clone(),
+                    recipient: self.account_id.clone(),
                     text: frame.text,
                     security_alert: None,
                     duplicate: false,
@@ -913,7 +997,7 @@ impl State {
                     sent_at: authenticated.then_some(frame.expires_at - MESSAGE_LIFETIME_SECONDS),
                     received_at: authenticated.then_some(current),
                     sender_fingerprint: if authenticated {
-                        if sender == self.email {
+                        if sender == self.account_id {
                             fingerprint(&self.upload.identity_key).ok()
                         } else {
                             self.identities
@@ -936,7 +1020,7 @@ impl State {
                 // A peer may have explicitly re-enrolled. Keep its first new
                 // PreKey message queued until the user verifies replacement;
                 // never turn an identity mismatch into a permanent ACK tombstone.
-                if sender != self.email
+                if sender != self.account_id
                     && matches!(
                         error.downcast_ref::<SignalProtocolError>(),
                         Some(SignalProtocolError::UntrustedIdentity(_))
@@ -950,7 +1034,7 @@ impl State {
         let received = decoded.unwrap_or(LocalMessage {
             id: message.id,
             sender,
-            recipient: self.email.clone(),
+            recipient: self.account_id.clone(),
             security_alert: Some(SECURITY_ALERT.to_owned()),
             text: None,
             duplicate: false,
@@ -991,8 +1075,32 @@ fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
 }
 async fn dispatch(request: Value) -> Result<Value> {
     let op = field(&request, "op")?;
+    #[cfg(feature = "device-linking")]
+    if op.starts_with("device_candidate_") {
+        ensure!(request.get("state").is_none(), "Invalid request.");
+        let now = current_time()?;
+        let mut candidate = if op == "device_candidate_create" {
+            DeviceCandidate::create(
+                serde_json::from_value(request["roster"].clone())?,
+                field(&request, "label")?,
+                field(&request, "root_fingerprint")?,
+                now,
+            )?
+        } else {
+            serde_json::from_value::<DeviceCandidate>(request["candidate"].clone())?
+        };
+        let data = match op {
+            "device_candidate_create" => {
+                json!({"code":candidate.code()?,"status":candidate.status()?})
+            }
+            "device_candidate_accept" => candidate.accept(field(&request, "code")?, now)?,
+            "device_candidate_status" => candidate.status()?,
+            _ => bail!("Unknown operation."),
+        };
+        return Ok(json!({"ok":true,"candidate":candidate,"data":data}));
+    }
     let mut state = if op == "init" {
-        State::initialize(field(&request, "email")?).await?
+        State::initialize(field(&request, "account_id")?, field(&request, "username")?).await?
     } else {
         let state: State = serde_json::from_value(
             request
@@ -1000,15 +1108,12 @@ async fn dispatch(request: Value) -> Result<Value> {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Missing state."))?,
         )?;
-        ensure!(
-            matches!(state.version, 1..=6) && normalized(&state.email)? == state.email,
-            "Invalid state."
-        );
+        state.validate_identity_schema()?;
         state
     };
     if op == "block_groups_for_contact" {
         state.block_groups_for_contact_if_pin(
-            field(&request, "email")?,
+            field(&request, "account_id")?,
             request
                 .get("fingerprint")
                 .map(|_| field(&request, "fingerprint"))
@@ -1025,6 +1130,64 @@ async fn dispatch(request: Value) -> Result<Value> {
         state.expire()?;
     }
     let data = match op {
+        #[cfg(feature = "device-linking")]
+        "device_authority_snapshot" => state.device_authority_snapshot()?,
+        #[cfg(feature = "device-linking")]
+        "device_authority_observe" => state.device_authority_observe(
+            field(&request, "origin")?,
+            serde_json::from_value(request["authority"].clone())?,
+            request["server_time"]
+                .as_i64()
+                .ok_or_else(|| anyhow::anyhow!("Invalid request."))?,
+        )?,
+        #[cfg(feature = "device-linking")]
+        "device_authority_inspect" => state.device_authority_inspect(
+            field(&request, "code")?,
+            request["server_time"]
+                .as_i64()
+                .ok_or_else(|| anyhow::anyhow!("Invalid request."))?,
+        )?,
+        #[cfg(feature = "device-linking")]
+        "device_authority_prepare" => {
+            state
+                .device_authority_prepare(
+                    field(&request, "origin")?,
+                    request["server_time"]
+                        .as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid request."))?,
+                )
+                .await?
+        }
+        #[cfg(feature = "device-linking")]
+        "device_authority_approve" => {
+            state
+                .device_authority_approve(
+                    field(&request, "code")?,
+                    field(&request, "expected_request_hash")?,
+                    request["server_time"]
+                        .as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid request."))?,
+                )
+                .await?
+        }
+        #[cfg(feature = "device-linking")]
+        "device_authority_revoke" => {
+            state
+                .device_authority_revoke(
+                    request["device_id"]
+                        .as_u64()
+                        .and_then(|id| u8::try_from(id).ok())
+                        .ok_or_else(|| anyhow::anyhow!("Invalid request."))?,
+                    request["server_time"]
+                        .as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid request."))?,
+                )
+                .await?
+        }
+        #[cfg(feature = "device-linking")]
+        "device_authority_commit" => {
+            state.device_authority_commit(serde_json::from_value(request["receipt"].clone())?)?
+        }
         "init" | "key_upload" => serde_json::to_value(state.key_upload())?,
         "validate_registered_keys" => {
             state.validate_registered_keys(&serde_json::from_value(request["keys"].clone())?)?;
@@ -1048,17 +1211,18 @@ async fn dispatch(request: Value) -> Result<Value> {
                 .add_contact(serde_json::from_value(request["bundle"].clone())?)
                 .await?
         }
-        "verify_contact" => {
-            state.verify_contact(field(&request, "email")?, field(&request, "fingerprint")?)?
-        }
+        "verify_contact" => state.verify_contact(
+            field(&request, "account_id")?,
+            field(&request, "fingerprint")?,
+        )?,
         "remove_contact" => state.remove_contact(
-            field(&request, "email")?,
+            field(&request, "account_id")?,
             field(&request, "previous_fingerprint")?,
         )?,
         "replace_contact" => {
             state
                 .replace_contact(
-                    field(&request, "email")?,
+                    field(&request, "account_id")?,
                     serde_json::from_value(request["bundle"].clone())?,
                     field(&request, "previous_fingerprint")?,
                     field(&request, "fingerprint")?,
@@ -1136,6 +1300,11 @@ pub fn call(input: &str) -> String {
             let text = error.to_string();
             let safe = match text.as_str() {
                 "key_maintenance_rejected"
+                | "device_authority_rejected"
+                | "device_authority_restore_required"
+                | "device_authority_pending"
+                | "device_authority_pending_expired"
+                | "device_authority_observe_required"
                 | "contact_verification_required"
                 | "contact_identity_changed"
                 | "contact_identity_removed"

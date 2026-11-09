@@ -15,6 +15,7 @@ required-features = ["cli"]
 [features]
 default = ["cli"]
 cli = ["dep:clap", "dep:reqwest", "dep:fs2", "dep:libc", "dep:url"]
+device-linking = []
 
 [dependencies]
 isyeet-wire = { path = "../wire" }

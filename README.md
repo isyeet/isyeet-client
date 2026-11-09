@@ -6,7 +6,13 @@ source for the distributed clients, licensed AGPL-3.0-only. Signal's official
 libsignal is pinned; its implementation has not been replaced. Source licenses
 do not grant ownership of the ISYEET name or promise access to the hosted relay.
 
-**Development release; independent security review is still pending.** Access to
+**Development source candidate; independent security review is still pending.**
+Publishing this source does not upload an iOS binary or announce general
+availability. Experimental device authorization is disabled by default and does
+not provide companion messaging. The native app includes an offline Manifesto
+reader. See [device authorization and remaining work](docs/DEVICE_LINKING.md).
+
+Access to
 https://api.isyeet.io is initially limited to invited testers. Staging accounts
 are separate. The clients enforce independent key verification, seven-day
 message expiry and fixed-size envelopes; these do not provide anonymity or a
@@ -23,8 +29,11 @@ cargo test --locked -p isyeet-client
 ```
 
 See [CLI and core API](crates/client/README.md). Use a separate private state file
-for each environment. Google native OAuth IDs are public configuration; your
-Desktop OAuth download, private keys and account-state files must stay private.
+for each environment. Protocol v2 uses usernames and passkeys; private message
+keys, bearer credentials and account-state files must stay private. Passkey sign-in
+does not link a second messaging installation. Experimental device authorization
+is available only with an explicit nondefault build feature; it grants no second
+inbox or messaging session. Ordinary builds and TestFlight keep it disabled.
 
 ## Build for iPhone
 
@@ -39,9 +48,10 @@ Open `ios/ISYEET.xcodeproj` and select Debug/Release for staging or Production
 for the production origin. Debug/Release accept your signing team in the ignored
 `ios/Config/Local.xcconfig`; Production deliberately excludes local overrides.
 For a Production build, configure your own team in Xcode's signing settings or
-pass `DEVELOPMENT_TEAM=YOUR_TEAM` to `xcodebuild`. You need your own Google iOS
-OAuth client if you change the bundle ID. Building the source does not require
-the operator's Apple, Cloudflare or Google secrets. App Store/TestFlight export
+pass `DEVELOPMENT_TEAM=YOUR_TEAM` to `xcodebuild`. Configure Associated Domains
+and your service's apple-app-site-association file for your app identifier. See
+[iOS passkey setup](ios/docs/PASSKEYS.md). Building the source does not require
+the operator's Apple or Cloudflare secrets. App Store/TestFlight export
 requires your own Apple account and distribution configuration. The included
 `testflight.sh` is the operator's guarded release wrapper and pins its team;
 adapt those checks and export options for your own account, or export in Xcode.

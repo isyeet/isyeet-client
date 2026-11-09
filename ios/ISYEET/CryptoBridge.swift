@@ -9,9 +9,11 @@ struct CoreResult: Decodable {
 }
 
 enum CoreError: Error, LocalizedError {
-    case coverClockUnavailable, coverUnavailable, verificationRequired, groupVerificationRequired, groupCapacityReached, identityChanged, retiredIdentity, contactRemovalRejected, rejected
+    case deviceAuthorityRestoreRequired, deviceAuthorityRejected, coverClockUnavailable, coverUnavailable, verificationRequired, groupVerificationRequired, groupCapacityReached, identityChanged, retiredIdentity, contactRemovalRejected, rejected
     var errorDescription: String? {
         switch self {
+        case .deviceAuthorityRestoreRequired: "The server's device list does not match this phone's saved authorization. Device approvals are stopped. Do not erase the saved authorization to bypass this warning."
+        case .deviceAuthorityRejected: "Device authorization was rejected. Check the complete request, matching fingerprints, automatic date and time, and the current device list before trying again."
         case .coverClockUnavailable: "Cover traffic is paused because the device clock could not be checked against the server. Use automatic date and time, then refresh."
         case .coverUnavailable: "Cover traffic is paused until a verified contact shares fresh consent and capacity is available."
         case .verificationRequired: "Verify this contact's fingerprint through a trusted channel before exchanging messages. Pending messages remain queued."
@@ -38,6 +40,8 @@ struct CryptoBridge {
         // The pointer originates from the bundled core, never from a network peer.
         let result = try JSONDecoder().decode(CoreResult.self, from: Data(String(cString: pointer).utf8))
         guard result.ok else {
+            if result.error == "device_authority_restore_required" { throw CoreError.deviceAuthorityRestoreRequired }
+            if operation.hasPrefix("device_authority_") { throw CoreError.deviceAuthorityRejected }
             if operation == "remove_contact" { throw CoreError.contactRemovalRejected }
             if result.error == "cover_clock_unavailable" { throw CoreError.coverClockUnavailable }
             if result.error == "cover_unavailable" { throw CoreError.coverUnavailable }

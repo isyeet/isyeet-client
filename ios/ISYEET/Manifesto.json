@@ -1,0 +1,74 @@
+{
+  "dispatch": "Dispatch\nSomewhere beyond the last paved road",
+  "cabin": "               (  )\n                )(\n      /\\       _||_       /\\\n     /  \\     /____\\     /  \\\n    /____\\   /______\\   /____\\\n      ||     | [] _ |     ||\n  ____||_____|___|_||_____||____",
+  "title": "All I want\nis text.",
+  "subtitle": "A small, entirely unreasonable manifesto\nin 95 printable characters.",
+  "introduction": [
+    "I want a cabin in the woods. A stove that burns wood. A chair that does not need an account. And one small computer through which my family can tell me they got home.",
+    "That is the whole technological future I am asking for.",
+    "Somehow this has become an extremist position."
+  ],
+  "sections": [
+    {
+      "heading": "01 / We had enough characters.",
+      "paragraphs": [
+        "ASCII gives me 95 printable characters. Letters. Numbers. Punctuation. A space, which is a beautiful invention because sometimes the correct thing to put between two things is nothing.",
+        "I can say \"i love you\". I can say \"bring soup\". I can say \"the creek is up, take the other road\". I can express the entire emotional range of a father with \"ok\", \"OK\", and \"ok.\"",
+        "If the situation demands visual art, I have this: :-)",
+        "If the situation deteriorates, I have this: :-(",
+        "The system is complete."
+      ]
+    },
+    {
+      "heading": "02 / Unicode should be banned.",
+      "paragraphs": [
+        "There. I said it. Put it on a wooden sign. Use normal quotation marks.",
+        "I do not want a character that is secretly three characters in a coat. I do not want an invisible passenger in the middle of a word. I do not want two things that look identical to have a disagreement at the byte level.",
+        "I went outside to split a log. When I came back, a family portrait was a sequence of code points negotiating custody of a zero-width joiner.",
+        "My mother is trying to ask whether I have enough blankets. This should not require a summit on how to render a tiny yellow person.",
+        "Ban it. At the very least, ban it within shouting distance of my porch. The squirrels and I will enforce the perimeter."
+      ]
+    },
+    {
+      "heading": "03 / A message is not a small website.",
+      "paragraphs": [
+        "No stickers. No autoplay. No confetti because I typed a date. No link preview opening a little window into a place I did not ask to visit.",
+        "I do not need to watch three dots perform the suspense of another person thinking. Let them think. I will also think. We can meet at the sentence when it is ready.",
+        "A message should arrive, contain words, and stop making demands."
+      ]
+    },
+    {
+      "heading": "04 / Boring is a feature.",
+      "paragraphs": [
+        "With printable ASCII, every character is one byte. The allowed set fits on a small chart. I can point to every member of it. None of them is waiting for a font update to reveal its true identity.",
+        "I want text I can save in a file and read years later. Text that survives being copied. Text whose punctuation has no aspirations beyond punctuation.",
+        "My apostrophe is straight. My hyphen is humble. My parentheses know when to leave.",
+        "This is not nostalgia. I also own a good kettle. Some things are simply finished."
+      ]
+    },
+    {
+      "heading": "05 / I want to be alone. Not unreachable.",
+      "paragraphs": [
+        "There is a difference.",
+        "I want the woods between me and the world. I do not want the woods between me and my family.",
+        "I want my brother to tell me about his day. I want my dad to send the same terrible joke twice because he forgot. I want my mom to ask if I am eating properly, and I want to lie very slightly and say yes.",
+        "mom > are you warm enough?\nme > yes. stove is going.\nmom > love you\nme > love you too <3",
+        "Look at that. Everything got through.",
+        "No animated heart could make it mean more."
+      ]
+    },
+    {
+      "heading": "06 / These are my terms.",
+      "paragraphs": [
+        "Give me a small program. Give me private words. Give me a keyboard and the people I care about on the other end.",
+        "Keep the feed. Keep the badges. Keep the expanding universe of things a message can do besides tell me something.",
+        "I will be out here with the rain on the roof, a stack of firewood, and 95 printable characters. If you need me, send a sentence.",
+        "All I want is text.\nAll I need is for it to be from you."
+      ]
+    }
+  ],
+  "closing": [
+    "Signed,\nA person who has had enough character development.",
+    "[EOF]\nThe stove needs another log."
+  ]
+}

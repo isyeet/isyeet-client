@@ -1669,7 +1669,7 @@
   },
   {
     "name": "yoke-derive",
-    "version": "0.8.3",
+    "version": "0.8.4",
     "license": "Unicode-3.0",
     "source": "registry+https://github.com/rust-lang/crates.io-index"
   },

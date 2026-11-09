@@ -4,31 +4,38 @@ use crate::tests::{bundle, connect, incoming, restart};
 #[test]
 fn removal_is_atomic_for_stale_noncanonical_unknown_and_self_targets() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         alice.add_contact(bundle(&bob)).await.unwrap();
         let pin = fingerprint(&bob.upload.identity_key).unwrap();
-        for (email, proof) in [
-            (&bob.email[..], "wrong"),
-            (&bob.email, &"0".repeat(64)),
+        for (account_id, proof) in [
+            (&bob.account_id[..], "wrong"),
+            (&bob.account_id, &"0".repeat(64)),
             ("Bob@gmail.com", &pin),
-            ("alice@gmail.com", &pin),
-            ("absent@gmail.com", &pin),
+            ("0beaac69-d53e-48d2-b5aa-dd405b7f414d", &pin),
+            ("ba5b59e9-2766-4d45-a760-66c169287014", &pin),
         ] {
             let before = serde_json::to_value(&alice).unwrap();
             assert_eq!(
-                alice.remove_contact(email, proof).unwrap_err().to_string(),
+                alice
+                    .remove_contact(account_id, proof)
+                    .unwrap_err()
+                    .to_string(),
                 REMOVAL_REJECTED
             );
             assert_eq!(serde_json::to_value(&alice).unwrap(), before);
         }
         let result = alice
-            .remove_contact(&bob.email, &pin.to_uppercase())
+            .remove_contact(&bob.account_id, &pin.to_uppercase())
             .unwrap();
-        assert_eq!(result, json!({"email":bob.email,"removed":true}));
-        assert!(!alice.has_contact(&bob.email));
+        assert_eq!(result, json!({"account_id":bob.account_id,"removed":true}));
+        assert!(!alice.has_contact(&bob.account_id));
         let removed = serde_json::to_value(&alice).unwrap();
-        assert!(alice.remove_contact(&bob.email, &pin).is_err());
+        assert!(alice.remove_contact(&bob.account_id, &pin).is_err());
         assert_eq!(serde_json::to_value(&alice).unwrap(), removed);
     });
 }
@@ -36,29 +43,38 @@ fn removal_is_atomic_for_stale_noncanonical_unknown_and_self_targets() {
 #[test]
 fn removal_cancels_all_group_legs_and_only_target_direct_history_preserving_other_crypto() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
-        let mut carol = State::initialize("carol@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
+        let mut carol = State::initialize("c36e0493-49f8-4439-aa4c-2aa333bf235f", "uc36e0493")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
         connect(&mut alice, &mut carol).await;
         let bob_pin = fingerprint(&bob.upload.identity_key).unwrap();
-        let incoming_old = bob.encrypt(&alice.email, "old history").await.unwrap();
+        let incoming_old = bob.encrypt(&alice.account_id, "old history").await.unwrap();
         alice.decrypt(incoming(&bob, incoming_old)).await.unwrap();
-        alice.encrypt(&bob.email, "old pending").await.unwrap();
-        let other_pending = alice.encrypt(&carol.email, "other pending").await.unwrap();
+        alice.encrypt(&bob.account_id, "old pending").await.unwrap();
+        let other_pending = alice
+            .encrypt(&carol.account_id, "other pending")
+            .await
+            .unwrap();
         let group = alice
-            .create_group("Fixed", &[bob.email.clone(), carol.email.clone()])
+            .create_group("Fixed", &[bob.account_id.clone(), carol.account_id.clone()])
             .unwrap();
         alice
             .encrypt_group(&group.id, "old group pending")
             .await
             .unwrap();
         let before = serde_json::to_value(&alice).unwrap();
-        alice.remove_contact(&bob.email, &bob_pin).unwrap();
+        alice.remove_contact(&bob.account_id, &bob_pin).unwrap();
         let after = serde_json::to_value(&alice).unwrap();
-        assert!(!alice.has_contact(&bob.email));
-        assert!(!alice.sessions.0.contains_key(&bob.email));
-        assert!(!alice.verified.contains(&bob.email));
+        assert!(!alice.has_contact(&bob.account_id));
+        assert!(!alice.sessions.0.contains_key(&bob.account_id));
+        assert!(!alice.verified.contains(&bob.account_id));
         assert_eq!(alice.outbox.len(), 1);
         assert_eq!(alice.outbox[0].id, other_pending.id);
         assert!(alice.group_outbox.is_empty());
@@ -68,7 +84,7 @@ fn removal_cancels_all_group_legs_and_only_target_direct_history_preserving_othe
                 .messages
                 .iter()
                 .all(|message| message.group_id.is_some()
-                    || (message.sender != bob.email && message.recipient != bob.email))
+                    || (message.sender != bob.account_id && message.recipient != bob.account_id))
         );
         assert_eq!(
             alice
@@ -93,17 +109,22 @@ fn removal_cancels_all_group_legs_and_only_target_direct_history_preserving_othe
         }
         assert_eq!(before["identities"]["pair"], after["identities"]["pair"]);
         assert_eq!(
-            before["sessions"][&carol.email],
-            after["sessions"][&carol.email]
+            before["sessions"][&carol.account_id],
+            after["sessions"][&carol.account_id]
         );
         assert_eq!(
-            before["identities"]["known"][&carol.email],
-            after["identities"]["known"][&carol.email]
+            before["identities"]["known"][&carol.account_id],
+            after["identities"]["known"][&carol.account_id]
         );
         // Benign removal permits an explicit same-key re-add and new manual verification.
         alice.add_contact(bundle(&bob)).await.unwrap();
-        assert!(alice.encrypt(&bob.email, "not yet verified").await.is_err());
-        alice.verify_contact(&bob.email, &bob_pin).unwrap();
+        assert!(
+            alice
+                .encrypt(&bob.account_id, "not yet verified")
+                .await
+                .is_err()
+        );
+        alice.verify_contact(&bob.account_id, &bob_pin).unwrap();
         assert!(alice.groups[&group.id].blocked);
         assert!(
             alice
@@ -111,7 +132,10 @@ fn removal_cancels_all_group_legs_and_only_target_direct_history_preserving_othe
                 .await
                 .is_err()
         );
-        let sent = alice.encrypt(&bob.email, "verified again").await.unwrap();
+        let sent = alice
+            .encrypt(&bob.account_id, "verified again")
+            .await
+            .unwrap();
         assert_eq!(
             bob.decrypt(incoming(&alice, sent))
                 .await
@@ -127,16 +151,20 @@ fn removal_cancels_all_group_legs_and_only_target_direct_history_preserving_othe
 fn warned_removal_cannot_retrust_old_pin_and_new_verified_pin_rejects_old_prekeys_without_warning()
 {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut old_bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut old_bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         connect(&mut alice, &mut old_bob).await;
         let old_pin = fingerprint(&old_bob.upload.identity_key).unwrap();
         let old_ciphertext = old_bob
-            .encrypt(&alice.email, "old delayed prekey")
+            .encrypt(&alice.account_id, "old delayed prekey")
             .await
             .unwrap();
-        alice.block_groups_for_contact(&old_bob.email).unwrap();
-        alice.remove_contact(&old_bob.email, &old_pin).unwrap();
+        alice.block_groups_for_contact(&old_bob.account_id).unwrap();
+        alice.remove_contact(&old_bob.account_id, &old_pin).unwrap();
         alice = restart(alice);
         let removed = serde_json::to_value(&alice).unwrap();
         let rejection = alice
@@ -155,17 +183,19 @@ fn warned_removal_cannot_retrust_old_pin_and_new_verified_pin_rejects_old_prekey
                 .to_string()
                 .contains("contact_identity_removed")
         );
-        let mut fresh = State::initialize(&old_bob.email).await.unwrap();
+        let mut fresh = State::initialize(&old_bob.account_id, &old_bob.username)
+            .await
+            .unwrap();
         fresh.add_contact(bundle(&alice)).await.unwrap();
         fresh
             .verify_contact(
-                &alice.email,
+                &alice.account_id,
                 &fingerprint(&alice.upload.identity_key).unwrap(),
             )
             .unwrap();
         alice.add_contact(bundle(&fresh)).await.unwrap();
         let fresh_message = fresh
-            .encrypt(&alice.email, "new phone pending verification")
+            .encrypt(&alice.account_id, "new phone pending verification")
             .await
             .unwrap();
         let pending = incoming(&fresh, fresh_message);
@@ -179,7 +209,7 @@ fn warned_removal_cannot_retrust_old_pin_and_new_verified_pin_rejects_old_prekey
         );
         alice
             .verify_contact(
-                &fresh.email,
+                &fresh.account_id,
                 &fingerprint(&fresh.upload.identity_key).unwrap(),
             )
             .unwrap();
@@ -197,7 +227,7 @@ fn warned_removal_cannot_retrust_old_pin_and_new_verified_pin_rejects_old_prekey
             Some("new phone pending verification")
         );
         let reply = alice
-            .encrypt(&fresh.email, "new phone reply")
+            .encrypt(&fresh.account_id, "new phone reply")
             .await
             .unwrap();
         assert_eq!(
@@ -215,28 +245,34 @@ fn warned_removal_cannot_retrust_old_pin_and_new_verified_pin_rejects_old_prekey
 #[test]
 fn retired_pin_records_are_bounded_and_unsafe_pins_outlive_queue_expiry_until_new_verification() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         alice.add_contact(bundle(&bob)).await.unwrap();
         let pin = fingerprint(&bob.upload.identity_key).unwrap();
-        alice.block_groups_for_contact(&bob.email).unwrap();
-        alice.remove_contact(&bob.email, &pin).unwrap();
+        alice.block_groups_for_contact(&bob.account_id).unwrap();
+        alice.remove_contact(&bob.account_id, &pin).unwrap();
         let expiry = alice.removed_contacts[0].expires_at;
         alice.expire_at(expiry + 1).unwrap();
-        assert!(alice.removed_pin(&bob.email, &pin));
+        assert!(alice.removed_pin(&bob.account_id, &pin));
         assert!(alice.add_contact(bundle(&bob)).await.is_err());
-        let fresh = State::initialize(&bob.email).await.unwrap();
+        let fresh = State::initialize(&bob.account_id, &bob.username)
+            .await
+            .unwrap();
         alice.add_contact(bundle(&fresh)).await.unwrap();
         alice
             .verify_contact(
-                &fresh.email,
+                &fresh.account_id,
                 &fingerprint(&fresh.upload.identity_key).unwrap(),
             )
             .unwrap();
         assert!(alice.removed_contacts.is_empty());
         alice.removed_contacts = (0..MAX_REMOVED)
             .map(|_| RemovedContact {
-                email: "old@gmail.com".into(),
+                account_id: "ac58f0a5-6450-4e34-8116-afa883a5a34d".into(),
                 fingerprint: pin.clone(),
                 expires_at: expiry + MESSAGE_LIFETIME_SECONDS,
                 unsafe_identity: false,
@@ -246,7 +282,7 @@ fn retired_pin_records_are_bounded_and_unsafe_pins_outlive_queue_expiry_until_ne
         assert!(
             alice
                 .remove_contact(
-                    &fresh.email,
+                    &fresh.account_id,
                     &fingerprint(&fresh.upload.identity_key).unwrap()
                 )
                 .is_err()
@@ -258,38 +294,46 @@ fn retired_pin_records_are_bounded_and_unsafe_pins_outlive_queue_expiry_until_ne
 }
 
 #[test]
-fn removal_ffi_has_safe_failure_and_v4_migrates_without_resetting_keys() {
+fn removal_ffi_has_safe_failure_and_rejects_old_identity_schema() {
     let (state, pin) = futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         alice.add_contact(bundle(&bob)).await.unwrap();
         (alice, fingerprint(&bob.upload.identity_key).unwrap())
     });
     let mut legacy = serde_json::to_value(&state).unwrap();
     legacy["version"] = json!(4);
     legacy.as_object_mut().unwrap().remove("removed_contacts");
-    let response: Value = serde_json::from_str(&call(&json!({"op":"remove_contact","state":legacy,"email":"bob@gmail.com","previous_fingerprint":pin}).to_string())).unwrap();
-    assert_eq!(response["ok"], true);
-    assert_eq!(
-        response["data"],
-        json!({"email":"bob@gmail.com","removed":true})
-    );
-    assert_eq!(response["state"]["version"], 6);
-    assert_eq!(response["state"]["upload"], legacy["upload"]);
-    let failure: Value = serde_json::from_str(&call(&json!({"op":"remove_contact","state":state,"email":"bob@gmail.com","previous_fingerprint":"SECRET_DO_NOT_ECHO"}).to_string())).unwrap();
+    let response: Value = serde_json::from_str(&call(&json!({"op":"remove_contact","state":legacy,"account_id":"300db02d-b75a-4922-8759-f08a0efa5a40","previous_fingerprint":pin}).to_string())).unwrap();
+    assert_eq!(response["ok"], false);
+    assert!(response.get("state").is_none());
+    let failure: Value = serde_json::from_str(&call(&json!({"op":"remove_contact","state":state,"account_id":"300db02d-b75a-4922-8759-f08a0efa5a40","previous_fingerprint":"SECRET_DO_NOT_ECHO"}).to_string())).unwrap();
     assert_eq!(failure, json!({"ok":false,"error":REMOVAL_REJECTED}));
 }
 
 #[test]
 fn removing_unverified_member_discards_unknown_group_quarantine_without_display() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
-        let mut carol = State::initialize("carol@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
+        let mut carol = State::initialize("c36e0493-49f8-4439-aa4c-2aa333bf235f", "uc36e0493")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
         connect(&mut alice, &mut carol).await;
         let group = alice
-            .create_group("Hidden roster", &[bob.email.clone(), carol.email.clone()])
+            .create_group(
+                "Hidden roster",
+                &[bob.account_id.clone(), carol.account_id.clone()],
+            )
             .unwrap();
         let copies = alice
             .encrypt_group(&group.id, "never promote after removal")
@@ -297,7 +341,7 @@ fn removing_unverified_member_discards_unknown_group_quarantine_without_display(
             .unwrap();
         let copy = copies
             .into_iter()
-            .find(|copy| copy.recipient == bob.email)
+            .find(|copy| copy.recipient == bob.account_id)
             .unwrap();
         assert!(bob.decrypt(incoming(&alice, copy)).await.unwrap().deferred);
         assert_eq!(bob.deferred_groups.len(), 1);
@@ -305,7 +349,7 @@ fn removing_unverified_member_discards_unknown_group_quarantine_without_display(
         bob.add_contact(bundle(&carol)).await.unwrap();
         let dedupe = serde_json::to_value(&bob.received).unwrap();
         bob.remove_contact(
-            &carol.email,
+            &carol.account_id,
             &fingerprint(&carol.upload.identity_key).unwrap(),
         )
         .unwrap();
@@ -321,24 +365,30 @@ fn removing_unverified_member_discards_unknown_group_quarantine_without_display(
 #[test]
 fn legacy_replacement_also_retires_old_prekeys_before_new_session_delivery() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
-        connect(&mut alice, &mut bob).await;
-        let old = bob
-            .encrypt(&alice.email, "old unseen prekey")
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
             .await
             .unwrap();
-        let mut fresh = State::initialize(&bob.email).await.unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
+        connect(&mut alice, &mut bob).await;
+        let old = bob
+            .encrypt(&alice.account_id, "old unseen prekey")
+            .await
+            .unwrap();
+        let mut fresh = State::initialize(&bob.account_id, &bob.username)
+            .await
+            .unwrap();
         fresh.add_contact(bundle(&alice)).await.unwrap();
         fresh
             .verify_contact(
-                &alice.email,
+                &alice.account_id,
                 &fingerprint(&alice.upload.identity_key).unwrap(),
             )
             .unwrap();
         alice
             .replace_contact(
-                &bob.email,
+                &bob.account_id,
                 bundle(&fresh),
                 &fingerprint(&bob.upload.identity_key).unwrap(),
                 &fingerprint(&fresh.upload.identity_key).unwrap(),
@@ -353,7 +403,7 @@ fn legacy_replacement_also_retires_old_prekeys_before_new_session_delivery() {
             assert_eq!(after[field], stores[field]);
         }
         let sent = fresh
-            .encrypt(&alice.email, "fresh verified phone")
+            .encrypt(&alice.account_id, "fresh verified phone")
             .await
             .unwrap();
         assert_eq!(

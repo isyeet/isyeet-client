@@ -30,29 +30,33 @@ only for literal loopback IP addresses; all other services require HTTPS. The
 state contains private keys, session credentials and recent plaintext messages;
 keep it on an encrypted local disk, never in source control or cloud sync. Do
 not restore old copies: rolling back a ratchet state is unsafe. One state per
-account, one immutable device identity per Gmail or Google Workspace address.
+account. Protocol addresses, identity pins, groups and delivery permissions use a
+random immutable account UUID, never a username or an email address. Usernames
+are exact ASCII labels: 3–24 lowercase letters, digits or underscores, starting
+with a letter. Local sends resolve the pinned username to its existing UUID;
+they never look up a new destination automatically.
 
 ```sh
-# Browser-based Google OAuth Desktop sign-in. Configure the same client ID in
-# the server's accepted audience list. Optional client secret can be in
-# ISYEET_GOOGLE_CLIENT_SECRET instead of shell history.
-isyeet --server https://service.example --state alice.json login --client-config /path/to/downloaded-desktop-client.json
-# Or: login --client-id YOUR.apps.googleusercontent.com
+# Browser passkey sign-in. Compare the short verification code before approval.
+# Sign-in proves account control; it does not link a second messaging device.
+isyeet --server https://api.isyeet.io --state alice.json login
+# A new production CLI installation authenticates but cannot create message keys.
+# Start on the phone; secure linked-device messaging is not yet implemented.
 
 # Only against an explicitly enabled development server on literal loopback:
-isyeet --state alice.json dev-login alice@gmail.com
-isyeet --state bob.json dev-login bob@gmail.com
+isyeet --state alice.json dev-login alice
+isyeet --state bob.json dev-login bob
 
 isyeet --state alice.json fingerprint
 isyeet --state bob.json fingerprint
-isyeet --state alice.json add-contact bob@gmail.com
-isyeet --state bob.json add-contact alice@gmail.com
+isyeet --state alice.json add-contact bob
+isyeet --state bob.json add-contact alice
 
 # Supply the complete 64-hex fingerprint obtained directly from each person:
-isyeet --state alice.json verify-contact bob@gmail.com --fingerprint BOBS_FINGERPRINT
-isyeet --state bob.json verify-contact alice@gmail.com --fingerprint ALICES_FINGERPRINT
+isyeet --state alice.json verify-contact bob --fingerprint BOBS_FINGERPRINT
+isyeet --state bob.json verify-contact alice --fingerprint ALICES_FINGERPRINT
 
-printf '%s' 'Hello Bob.' | isyeet --state alice.json send bob@gmail.com
+printf '%s' 'Hello Bob.' | isyeet --state alice.json send bob
 isyeet --state bob.json receive
 isyeet --state alice.json retry
 isyeet --state bob.json history
@@ -60,10 +64,10 @@ isyeet --state bob.json history
 # Test your own account through the same encrypted relay queue:
 printf '%s' 'Self delivery test.' | isyeet --state alice.json send-self
 isyeet --state alice.json receive
-# Equivalent: send alice@gmail.com
+# Equivalent: send alice
 
 # Every selected peer must already be independently verified:
-isyeet --state alice.json create-group --title 'Project' bob@gmail.com carol@gmail.com
+isyeet --state alice.json create-group --title 'Project' bob carol
 isyeet --state alice.json groups
 printf '%s' 'Group text.' | isyeet --state alice.json send-group GROUP_ID
 ```
@@ -124,9 +128,9 @@ fingerprint with `contacts`, then remove the old contact before re-adding:
 
 ```sh
 isyeet --state alice.json contacts
-isyeet --state alice.json remove-contact bob@gmail.com --previous-fingerprint OLD_BOBS_FINGERPRINT
-isyeet --state alice.json add-contact bob@gmail.com
-isyeet --state alice.json verify-contact bob@gmail.com --fingerprint NEW_BOBS_FINGERPRINT
+isyeet --state alice.json remove-contact bob --previous-fingerprint OLD_BOBS_FINGERPRINT
+isyeet --state alice.json add-contact bob
+isyeet --state alice.json verify-contact bob --fingerprint NEW_BOBS_FINGERPRINT
 ```
 
 Removal requires the full current saved fingerprint so a stale confirmation
@@ -176,17 +180,111 @@ is not running; the next invocation deletes expired entries before display or
 network activity. Previously printed terminal output and copies made outside
 ISYEET are outside this retention mechanism.
 
-Upgrading version-1 state discards undated local messages and unsent ciphertext;
-there is no trustworthy send time from which to calculate their age. Encryption
-keys, established ratchets and verified contacts remain unchanged. Authenticated
-legacy ISY1 messages are byte-validated, silently discarded and acknowledged.
+Email-based state versions 1–6 are rejected without modifying or exporting their
+private material. They must not be relabeled with a username or copied to the new
+protocol. Fresh phone enrollment creates a new messaging identity; contacts must
+independently verify it. Authenticated legacy ISY1 frames remain byte-validated,
+silently discarded and acknowledged.
 The new ISY2 frame is exactly 2048 bytes: magic at 0..4, signed big-endian i64 UTC
 expiration seconds at 4..12, big-endian u16 length at 12..14, printable ASCII at
 14..14+length, and random padding. An implied send time more than 60 seconds ahead
 of the receiver clock is rejected. The outer encrypted envelope stays 8192 bytes.
-Current opaque state is version 6. Existing version-2 through version-5 state migrates without
-changing keys, sessions, dated history or original pending deadlines. Older
-clients reject version 6 rather than silently dropping group, warning, traffic, retired-pin or key-maintenance state.
+Current opaque state is version 7. Only version 7 is accepted. Group member,
+descriptor and local row hashes use v2 domain separators and immutable UUIDs.
+Usernames are metadata and never substitute for Signal identity verification.
+
+## Experimental device authorization
+
+This is an authorization experiment, **not linked messaging**. Ordinary builds
+exclude these CLI commands and FFI operations. The corresponding Worker and iOS
+Devices view also require their separate experimental build flags. No released
+service or app enables this workflow. See [the design and limits](../../docs/DEVICE_LINKING.md).
+
+Build a separate experimental binary:
+
+```sh
+CARGO_TARGET_DIR=target/device-linking cargo build --locked -p isyeet-client --features device-linking
+```
+
+First initialize the device authority in the experimental primary phone's Devices
+view. Obtain its full root fingerprint directly from that phone. Against the
+matching experimental service, create a **new, separate** candidate state file:
+
+```sh
+target/device-linking/debug/isyeet --server "$EXPERIMENTAL_API_URL" --state desktop-candidate.json \
+  device-request --label 'My desktop' --root-fingerprint "$PHONE_ROOT_FINGERPRINT"
+```
+
+This opens the existing passkey browser approval flow. Compare its short code,
+then approve access to the same account as the phone. The CLI uses the returned
+account token only to read the signed device roster; it never saves that token or
+creates a messaging session. The independent phone fingerprint is mandatory:
+account authentication and the relay's directory cannot authorize a device.
+
+The CLI generates its own fresh Signal identity key and saves the private
+candidate file atomically before showing the public `ISYEET-LINK-1:` request
+code. It refuses to overwrite an existing state file. Copy that request into the
+phone within five minutes. Compare the account, origin, root fingerprint, full
+candidate identity fingerprint and exact request hash on both devices before
+approving. Labels are 1–32 printable ASCII bytes. The phone obtains a fresh
+`device_manage` passkey proof and signs the authorization with its existing root
+identity. It saves the exact pending change before sending it to the service.
+
+After the phone confirms the committed roster with a fresh read, copy its public
+`ISYEET-APPROVAL-1:` code into the CLI through standard input:
+
+```sh
+target/device-linking/debug/isyeet --server "$EXPERIMENTAL_API_URL" --state desktop-candidate.json device-accept
+# Paste the single approval-code line, then end standard input with Ctrl-D.
+
+target/device-linking/debug/isyeet --server "$EXPERIMENTAL_API_URL" --state desktop-candidate.json device-status
+```
+
+Acceptance checks the exact candidate request, identity, account, service, root
+epoch, signatures and lifetimes before saving. It always reports
+`messaging_available: false`. The private candidate file contains only the new
+device's key and public authorization data; it is not a regular messaging state
+and cannot be used by `send`, `receive` or `login`. The phone's private root key,
+sessions and history never enter it. `device-status` validates and displays only
+saved local authorization; it does **not** contact the service or establish that
+the device remains authorized. Revocation happens in the primary phone's Devices
+view. New message keys, per-device mailboxes, future-message fanout and linked
+device messaging remain separate future work.
+
+Experimental C ABI callers use the existing JSON entry point with these actions:
+
+| Action | Additional request fields |
+| --- | --- |
+| `device_authority_snapshot` | `state` |
+| `device_authority_observe` | `state`, `origin`, `authority` (signed roster or null), `server_time` |
+| `device_authority_inspect` | `state`, `code`, `server_time` |
+| `device_authority_prepare` | `state`, `origin`, `server_time` |
+| `device_authority_approve` | `state`, `code`, `expected_request_hash`, `server_time` |
+| `device_authority_revoke` | `state`, `device_id`, `server_time` |
+| `device_authority_commit` | `state`, `receipt` |
+| `device_candidate_create` | `roster`, `label`, `root_fingerprint` |
+| `device_candidate_accept` | `candidate`, `code` |
+| `device_candidate_status` | `candidate` |
+
+Authority calls return the updated opaque `state` and public `data`. Candidate
+calls return a separate private `candidate` value and public `data`; they reject
+a main `state` argument. Save the private returned value before displaying any
+code or sending any signed change. Every caller must preserve this ordering; the
+JSON core itself does not write host storage. A snapshot exposes the current
+signed authority, exact pending change, burned allocation counters and any
+eligible approval code. Receipt commit alone never releases an approval code;
+the caller must save that state and then observe the current signed roster.
+Exports require observation within 60 seconds and an unexpired candidate and
+roster. The core independently bounds server timestamps against its local clock.
+
+Retry the persisted pending change exactly with a fresh scoped passkey grant.
+After an uncertain response, a read matching that exact signed roster confirms
+the commit. An expired pending change can be discarded only after observing its
+unchanged predecessor; allocated roster versions, device IDs and candidate keys
+remain burned. A missing local authority sidecar cannot adopt an existing remote
+authority. Restore or rollback of old private state requires re-enrollment; do
+not copy or restore these files. Default builds preserve the optional sidecar as
+opaque JSON while refusing all experimental actions, leaving v2 messaging intact.
 
 ## Automatic key maintenance
 
@@ -194,8 +292,7 @@ After initial registration, online clients check the relay key inventory at most
 hourly. Fewer than 16 available EC one-time prekeys triggers a top-up to 32.
 The signed EC and signed last-resort Kyber1024 prekeys rotate together every
 30 days; the account identity and existing Signal sessions do not change.
-Legacy state schedules its first rotation at the first successful maintenance
-check. This uses the same pinned official libsignal generation and signatures.
+This uses the same pinned official libsignal generation and signatures.
 
 A proposal contains the new private keys plus one exact public request with a
 UUID and expected relay generation. Save it atomically **before** uploading.
@@ -216,13 +313,13 @@ maintenance so authenticated messages can consume one-time keys and free space.
 This does not provide indefinite support for externally cached old bundles.
 
 Freshly initialized state alone has `initial_upload_pending=true`. The exact
-initial upload can be retried with its originally saved session. On a fresh OAuth
-login to any existing state, check `/v1/keys/me` against `validate_registered_keys`
+initial upload can be retried with its originally saved session. On a fresh passkey
+login to any existing state, check `/v2/keys/me` against `validate_registered_keys`
 before adopting the new bearer. Only current or exactly journaled public keys
 are accepted. A missing registration cannot cause automatic re-publication of
 an old identity, even if an earlier initial-upload response was lost. A matching
 registration confirms the lost initial response. If the account was deleted or
-replaced, explicit local recovery is required; Google login cannot restore keys.
+replaced, explicit local recovery is required; Passkey sign-in cannot restore message keys.
 
 ## Cover traffic
 
@@ -270,7 +367,7 @@ updated frame uses the same 288-byte authenticated trailer at 1760..2048:
 16-byte `ISYEET-COVER-V1\0` marker, one consent byte, an eight-byte signed
 big-endian confirmed relay lease timestamp, one receipt-count byte, eight 32-byte nonce
 slots, and six reserved bytes. Unused slots and reserved bytes remain random.
-Count-selected receipt slots acknowledge covers from that specific email and
+Count-selected receipt slots acknowledge covers from that specific account ID and
 identity only. The 8,192-byte envelope and relay `SendRequest` are unchanged.
 
 Cover frames use the existing official Signal session and ordinary durable
@@ -299,8 +396,14 @@ windows, recipient choice, outages, backlogs and outer expiration timestamps
 still disclose characteristics. Cover traffic can pause at its limits or when
 there is no fresh consenting contact; the host must describe that honestly.
 
-The native client should PUT `/v1/contacts` with
-`{"emails":[<verified canonical contact emails>]}` after persisting verification,
+Use POST `/v2/directory/lookup` with `{"username":"bob"}` for exact
+non-consuming lookup. Validate the response username, then request the key bundle
+for its account ID and validate both fields again. A known username returning a
+different account ID is rejected without changing the old pin. The core also
+rejects conflicting username metadata.
+
+The native client should PUT `/v2/contacts` with
+`{"account_ids":[<verified immutable account UUIDs>]}` after persisting verification,
 and resynchronize before send/retry/receive. Never publish an unverified contact.
 
 ## C JSON ABI
@@ -324,23 +427,23 @@ the caller's obsolete warning sidecar only with the successful removal save.
 
 | Request fields (besides `op`) | `op` | `data` result |
 | --- | --- | --- |
-| `email` | `init` | Wire `KeyUpload` |
+| `account_id`, `username` | `init` | Wire `KeyUpload` |
 | `state` | `key_upload` | Current public `KeyUpload`; publish through initial PUT only while `initial_upload_pending` is true |
-| `state`, `keys` (`KeyUpload` from authenticated `/v1/keys/me`) | `validate_registered_keys` | `null`; accepts only this device's current or exactly journaled pair and a known remaining EC subset, never adopts remote keys |
+| `state`, `keys` (`KeyUpload` from authenticated `/v2/keys/me`) | `validate_registered_keys` | `null`; accepts only this device's current or exactly journaled pair and a known remaining EC subset, never adopts remote keys |
 | `state` | `confirm_initial_upload` | Snapshot; clear fresh-initial-upload flag after confirmed initial PUT or validated own registration |
-| `state`, `inventory` (`{generation,keys}` from GET `/v1/keys/maintenance`) | `prepare_key_maintenance` | Public maintenance request or `null`; save returned state before any PUT |
-| `state`, `receipt` (`{operation_id,generation}` from PUT `/v1/keys/maintenance`) | `confirm_key_maintenance` | Snapshot after exact pending UUID and next-generation validation |
-| `state`, `bundle` (wire `KeyBundle`) | `add_contact` | `{email,fingerprint,verified}` |
-| `state`, `email`, `fingerprint` (full 64 hex) | `verify_contact` | `{email,fingerprint,verified:true}` |
-| `state`, `email`, `bundle`, `previous_fingerprint`, `fingerprint` (both full 64 hex) | `replace_contact` | Legacy ABI compatibility only, not the current app/CLI workflow; returns `{email,fingerprint,verified:true}` after the same retired-pin protection and fresh signed-bundle validation |
-| `state`, `email`, `previous_fingerprint` (current full 64 hex) | `remove_contact` | `{email,removed:true}`; atomic local removal and targeted cancellation, followed by caller permission sync |
+| `state`, `inventory` (`{generation,keys}` from GET `/v2/keys/maintenance`) | `prepare_key_maintenance` | Public maintenance request or `null`; save returned state before any PUT |
+| `state`, `receipt` (`{operation_id,generation}` from PUT `/v2/keys/maintenance`) | `confirm_key_maintenance` | Snapshot after exact pending UUID and next-generation validation |
+| `state`, `bundle` (wire `KeyBundle`) | `add_contact` | `{account_id,username,fingerprint,verified}` |
+| `state`, `account_id`, `fingerprint` (full 64 hex) | `verify_contact` | `{account_id,username,fingerprint,verified:true}` |
+| `state`, `account_id`, `bundle`, `previous_fingerprint`, `fingerprint` (both full 64 hex) | `replace_contact` | Legacy ABI compatibility only, not the current app/CLI workflow; returns `{account_id,username,fingerprint,verified:true}` after the same retired-pin protection and fresh signed-bundle validation |
+| `state`, `account_id`, `previous_fingerprint` (current full 64 hex) | `remove_contact` | `{account_id,removed:true}`; atomic local removal and targeted cancellation, followed by caller permission sync |
 | `state`, `recipient`, `text` | `encrypt` | Wire `SendRequest`, already appended to state outbox |
 | `state`, `enabled` (boolean) | `set_traffic_mode` | Snapshot after changing cover mode; emits no messages |
 | `state`, `server_time` (integer), `elapsed_seconds` (integer 0..60) | `confirm_traffic_quiet` | Snapshot after recording a fresh confirmed quiet-policy response; requires local Cover mode and fails with `cover_clock_unavailable` on invalid clock/round-trip bounds |
 | `state`, `recipient` | `create_cover` | Ordinary wire `SendRequest` in outbox, without a history row; `cover_unavailable` on ineligibility or exhausted bounds |
-| `state`, `title`, `members` (canonical peer emails, excluding self) | `create_group` | Immutable `Group`; automatically includes self |
+| `state`, `title`, `members` (canonical peer account UUIDs, excluding self) | `create_group` | Immutable `Group`; automatically includes self |
 | `state`, `group_id`, `text` | `encrypt_group` | `[SendRequest]`; all legs and one logical history row committed together |
-| `state`, `email`, optional `fingerprint` (expected old pin) | `block_groups_for_contact` | `null`; permanently warns the pin, blocks affected groups and cancels every unsent leg; expected-pin mismatch is a no-op |
+| `state`, `account_id`, optional `fingerprint` (expected old pin) | `block_groups_for_contact` | `null`; permanently warns the pin, blocks affected groups and cancels every unsent leg; expected-pin mismatch is a no-op |
 | `state`, `message` (wire `QueuedMessage`) | `decrypt` | `LocalMessage` described below |
 | `state`, `id` | `sent` | `null`; removes matching accepted message from outbox |
 | `state` | `snapshot` | Snapshot described below, with proposed state after expiry/resolution |
@@ -355,15 +458,15 @@ identity/registration and current or replacement signed pair. The receipt is
 `{operation_id,generation}` with the expected generation plus one. Maintenance
 errors use the safe code `key_maintenance_rejected` and never return a state.
 
-`contacts` contains `{email,fingerprint,verified}` records. A `LocalMessage` is
+`contacts` contains `{account_id,username,fingerprint,verified}` records. A `LocalMessage` is
 `{id,sender,recipient,duplicate,expires_at,expired,deferred,cover,text?,security_alert?}`;
 optional values are omitted. `SendRequest` includes the absolute `expires_at`
 deadline alongside `id`, `recipient`, and `envelope`. Missing legacy deadlines
-decode as zero for migration; new relay requests must carry a valid deadline. `messages` includes outgoing and incoming records. SHA-256 fingerprints
-cover the full serialized public identity key (not the Gmail address or server
+decode as zero and are expired without display; new relay requests must carry a valid deadline. `messages` includes outgoing and incoming records. SHA-256 fingerprints
+cover the full serialized public identity key (not the username or server
 response). Contacts are pinned, cannot silently change, and must be manually
 verified before encrypt/decrypt. `replace_contact` requires an existing contact,
-an exact canonical target/bundle email, the current pin and a different new
+an exact canonical target/bundle account ID, the current pin and a different new
 identity matching the independently supplied fingerprint. It validates fresh
 Signal signed prekeys on a clone, then atomically replaces that peer's session,
 pin and verification while removing its old direct history/outbox, retaining group
@@ -385,7 +488,7 @@ The native API is `cover_enabled()`, `set_traffic_mode(bool)`,
 Create and mode changes return proposed state under the same persistence rule.
 
 A `Group` contains `{id,title,members,blocked,created_at,nonce}`;
-members are `{email,fingerprint}` and `id` is a 64-hex descriptor hash. The local
+members are `{account_id,fingerprint}` and `id` is a 64-hex descriptor hash. The local
 `created_at` and descriptor `nonce` are implementation fields; UI needs only the
 first four fields. `outbox_refs` is a separate array of
 `{id,group_id,message_id,recipient}` linking transport IDs to local history IDs;
@@ -399,13 +502,13 @@ when the message was authenticated or created and do not change later. Generic
 rejections have no invented authenticated metadata. Status is `queued`,
 `partially_accepted`, `relay_accepted`, `received`, or `cancelled`; counts describe
 relay acceptance only and are omitted for incoming messages. Group rows use a
-deterministic UUID bound to group, canonical author email, author fingerprint and
+deterministic UUID bound to group, immutable author account ID, author fingerprint and
 authenticated logical UUID. `logical_id` preserves that authenticated UUID;
-`recipient` on a group row is the local canonical account email.
+`recipient` on a group row is the local immutable account ID.
 
 `deferred:true` is an authenticated quarantine transition with no displayed text
 or history row; persist and ACK it normally. `pending_group_senders` contains
-only already-verified sender emails for a generic banner. `next_expiry` covers
+only already-verified sender account IDs for a generic banner. `next_expiry` covers
 hidden quarantined plaintext as well as history, outbox, cover consent and
 bounded receipt/reservation deadlines. The
 top-level `resolved_message_ids` lists newly promoted history IDs during exactly
@@ -420,7 +523,7 @@ the entire call, allowing all warnings to be installed first. A failed-save
 warning may include its captured expected fingerprint, so recovery cannot warn a
 different replacement key that was already durably saved.
 
-Passing the local account email as `encrypt.recipient` uses the self channel;
+Passing the local account ID as `encrypt.recipient` uses the self channel;
 `decrypt` accepts that same canonical sender only with the pinned local identity.
 There is no separate self-contact, key claim, verification operation or recipient
 permission entry. The optional opaque `self_channel` state is initialized on
@@ -468,3 +571,20 @@ Empty group records retire after one week only when no retained message, pending
 leg or quarantine references them. A blocked record remains while all captured
 pins still match the locally verified identities, preventing silent revival;
 after a real pin replacement, an empty expired blocked record may retire.
+
+## Browser passkey sign-in for the CLI
+
+The CLI generates a random 32-byte PKCE verifier and sends only its SHA-256
+challenge to `/v2/auth/cli/start`. It opens only the returned same-origin
+`/auth?request=<UUID>` page after checking the request ID, short code, and a
+maximum five-minute expiry. The user compares the eight-character code and
+explicitly approves after passkey authentication. Polling `/v2/auth/cli/redeem`
+uses the secret verifier in a POST body, at least five seconds apart. No access
+token or verifier appears in a browser URL, terminal output, or localhost
+callback. A lost successful redemption requires starting sign-in again.
+
+A new production CLI installation does not generate or publish Signal keys after
+this sign-in. It reports authentication separately and saves no account session.
+Passkey management remains in the browser; phone-approved messaging-device
+linking is future work. Loopback `dev-login` can still enroll isolated test
+accounts and exercise real official-libsignal message delivery.

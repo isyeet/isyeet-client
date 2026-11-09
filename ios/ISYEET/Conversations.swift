@@ -3,17 +3,17 @@ import SwiftUI
 struct ConversationView: View {
     @ObservedObject var model: AppModel
     @Environment(\.appearance) private var appearance
-    let email: String
+    let account_id: String
     @State private var text = ""
     @State private var showingContact = false
     @State private var showingFaces = false
     @State private var selectedMessage: MessageSelection?
 
-    private var contact: Contact? { model.snapshot?.contacts.first { $0.email == email } }
-    private var isSelfConversation: Bool { model.snapshot?.email == email }
-    private var title: String { isSelfConversation ? "Message yourself" : email }
-    private var pendingSelfCount: Int { model.snapshot?.outbox.filter { $0.recipient == email }.count ?? 0 }
-    private var identityChanged: Bool { model.pendingIdentityChanges.contains(email) }
+    private var contact: Contact? { model.snapshot?.contacts.first { $0.account_id == account_id } }
+    private var isSelfConversation: Bool { model.snapshot?.account_id == account_id }
+    private var title: String { isSelfConversation ? "Message yourself" : model.displayName(account_id) }
+    private var pendingSelfCount: Int { model.snapshot?.outbox.filter { $0.recipient == account_id }.count ?? 0 }
+    private var identityChanged: Bool { model.pendingIdentityChanges.contains(account_id) }
     private var verified: Bool { isSelfConversation || contact?.verified == true && !identityChanged }
     private var canSend: Bool {
         verified && !model.busy && !text.isEmpty && !model.needsAuthentication && model.fatalError == nil
@@ -50,18 +50,18 @@ struct ConversationView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16).padding(.vertical, 12).background(appearance.surface)
                 }
-                MessageTranscript(model: model, conversationID: email, selfConversation: isSelfConversation) { selectedMessage = $0 }
+                MessageTranscript(model: model, conversationID: account_id, selfConversation: isSelfConversation) { selectedMessage = $0 }
                 composer
             } else {
                 ContentUnavailableView("Conversation unavailable", systemImage: "lock")
             }
         }
         .font(appearance.font(.body)).foregroundStyle(appearance.primary).background(appearance.background)
-        .onAppear { model.conversationDidAppear(email) }
-        .onDisappear { model.conversationDidDisappear(email) }
+        .onAppear { model.conversationDidAppear(account_id) }
+        .onDisappear { model.conversationDidDisappear(account_id) }
         .sheet(isPresented: $showingContact, onDismiss: { model.setPresentationCovered("contact-details", covered: false) }) {
             NavigationStack {
-                ContactDetailsView(model: model, email: email)
+                ContactDetailsView(model: model, account_id: account_id)
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showingContact = false } } }
             }
         }
@@ -124,7 +124,7 @@ struct ConversationView: View {
     private func send() {
         guard canSend else { return }
         let submitted = text
-        Task { if await model.send(text: submitted, recipient: email), text == submitted { text = "" } }
+        Task { if await model.send(text: submitted, recipient: account_id), text == submitted { text = "" } }
     }
 }
 
@@ -132,7 +132,7 @@ struct ConversationView: View {
 // the same verification workflow. Merely viewing it never marks messages read.
 struct ContactDetailsView: View {
     @ObservedObject var model: AppModel
-    let email: String
+    let account_id: String
     var openConversation: (() -> Void)? = nil
     @Environment(\.appearance) private var appearance
     @State private var fingerprint = ""
@@ -140,8 +140,8 @@ struct ContactDetailsView: View {
     @State private var feedback: String?
     @State private var coverageID = "contact-management:" + UUID().uuidString
 
-    private var contact: Contact? { model.snapshot?.contacts.first { $0.email == email } }
-    private var identityChanged: Bool { model.pendingIdentityChanges.contains(email) }
+    private var contact: Contact? { model.snapshot?.contacts.first { $0.account_id == account_id } }
+    private var identityChanged: Bool { model.pendingIdentityChanges.contains(account_id) }
     private var available: Bool { !model.busy && !model.needsAuthentication && model.fatalError == nil && removal == nil }
     private var removalAvailable: Bool { !model.busy && model.fatalError == nil && removal == nil }
 
@@ -150,7 +150,8 @@ struct ContactDetailsView: View {
             if let contact {
                 Section {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text(verbatim: email).font(appearance.font(.headline)).textSelection(.enabled)
+                        Text(verbatim: model.displayName(account_id)).font(appearance.font(.headline)).textSelection(.enabled)
+                        Text(verbatim: account_id).font(appearance.font(.caption)).foregroundStyle(appearance.secondary).textSelection(.enabled)
                         Label(identityChanged ? "KEY CHANGE — STOP AND VERIFY" : (contact.verified ? "Verified on this device" : "Not verified"),
                               systemImage: identityChanged || !contact.verified ? "exclamationmark.shield" : "checkmark.shield")
                             .font(appearance.font(.subheadline)).foregroundStyle(identityChanged || !contact.verified ? appearance.warning : appearance.accent)
@@ -164,7 +165,7 @@ struct ContactDetailsView: View {
                     Section("Identity changed") {
                         Label("KEY CHANGED", systemImage: "exclamationmark.triangle.fill")
                             .font(appearance.font(.title2).bold()).foregroundStyle(appearance.warning)
-                        Text("This may be a lost-device re-enrollment or an impersonation attempt. Google sign-in does not prove the new encryption identity. Sending is blocked. Remove the old contact, add them again, then independently compare the new fingerprint outside ISYEET. Existing affected groups cannot be reused.")
+                        Text("This may be a lost-device re-enrollment or an impersonation attempt. Passkey sign-in does not prove the new encryption identity. Sending is blocked. Remove the old contact, add them again, then independently compare the new fingerprint outside ISYEET. Existing affected groups cannot be reused.")
                             .foregroundStyle(appearance.warning)
                     }.listRowBackground(appearance.surface)
                 }
@@ -217,7 +218,7 @@ struct ContactDetailsView: View {
         guard MessageSafety.validFingerprint(expected) else { feedback = SafetyError.invalidFingerprint.errorDescription; return }
         feedback = nil
         Task {
-            await model.verifyContact(email: email, fingerprint: expected)
+            await model.verifyContact(account_id: account_id, fingerprint: expected)
             if contact?.verified == true && contact?.fingerprint == expected { fingerprint = "" }
             else { feedback = "Verification was not saved. Check the full fingerprint with this person outside ISYEET." }
         }
@@ -461,10 +462,10 @@ private struct MessageTranscript: View {
                             model.setPresentationCovered("message-details", covered: true)
                             select(MessageSelection(id: message.id))
                         } label: {
-                            MessageRow(message: message, incoming: !selfConversation && message.sender != model.snapshot?.email,
+                            MessageRow(message: message, incoming: !selfConversation && message.sender != model.snapshot?.account_id,
                                        selfConversation: selfConversation,
                                        pending: model.snapshot?.outbox.contains { $0.id == message.id } == true,
-                                       groupAuthor: group ? message.sender : nil)
+                                       groupAuthor: group ? model.displayName(message.sender) : nil)
                         }.buttonStyle(.plain).accessibilityHint("Show message details")
                     }
                     if messages.isEmpty {
@@ -500,9 +501,9 @@ private struct GroupDetailsView: View {
                         }
                     }.listRowBackground(appearance.surface)
                     Section("Members") {
-                        ForEach(group.members, id: \.email) { member in
+                        ForEach(group.members, id: \.account_id) { member in
                             VStack(alignment: .leading, spacing: 8) {
-                                Text(verbatim: member.email)
+                                Text(verbatim: model.displayName(member.account_id))
                                 Text(verbatim: member.fingerprint).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                             }
                         }
@@ -605,10 +606,10 @@ private struct RemoveContactView: View {
         NavigationStack {
             Form {
                 Section {
-                    Text(verbatim: request.email).font(appearance.font(.headline))
+                    Text(verbatim: model.displayName(request.account_id)).font(appearance.font(.headline))
                     Label("REMOVE OLD TRUST", systemImage: "exclamationmark.triangle.fill")
                         .font(appearance.font(.title2).bold()).foregroundStyle(appearance.warning)
-                    Text("If this person's key changed, do not assume the new key belongs to them. After removal, add their address again and independently verify the new fingerprint outside ISYEET. Google sign-in is not proof of a key.")
+                    Text("If this person's key changed, do not assume the new key belongs to them. After removal, add their address again and independently verify the new fingerprint outside ISYEET. Passkey sign-in is not proof of a key.")
                     Text("This permanently deletes their direct history and pending sends on this device. Existing affected groups remain blocked; create new groups after verifying everyone again.")
                 }.listRowBackground(appearance.surface)
                 Section("Saved fingerprint being removed") {

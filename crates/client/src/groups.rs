@@ -7,13 +7,13 @@ use std::collections::BTreeMap;
 const MAX_GROUPS: usize = 32;
 const MAX_DEFERRED: usize = 64;
 const MAX_LOGICAL: usize = 4096;
-const TOKEN_DOMAIN: &[u8] = b"ISYEET group member v1\0";
-const GROUP_DOMAIN: &[u8] = b"ISYEET immutable group v1\0";
-const ROW_DOMAIN: &[u8] = b"ISYEET local group row v1\0";
+const TOKEN_DOMAIN: &[u8] = b"ISYEET group member v2\0";
+const GROUP_DOMAIN: &[u8] = b"ISYEET immutable group v2\0";
+const ROW_DOMAIN: &[u8] = b"ISYEET local group row v2\0";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GroupMember {
-    pub email: String,
+    pub account_id: String,
     pub fingerprint: String,
 }
 
@@ -87,11 +87,14 @@ fn unhex<const N: usize>(text: &str) -> Result<[u8; N]> {
     Ok(bytes)
 }
 fn member_token(member: &GroupMember) -> Result<[u8; 32]> {
-    ensure!(normalized(&member.email)? == member.email, SECURITY_ALERT);
+    ensure!(
+        normalized(&member.account_id)? == member.account_id,
+        SECURITY_ALERT
+    );
     let mut hash = Sha256::new();
     hash.update(TOKEN_DOMAIN);
-    hash.update((member.email.len() as u16).to_be_bytes());
-    hash.update(member.email.as_bytes());
+    hash.update((member.account_id.len() as u16).to_be_bytes());
+    hash.update(member.account_id.as_bytes());
     hash.update(unhex::<32>(&member.fingerprint)?);
     Ok(hash.finalize().into())
 }
@@ -222,33 +225,36 @@ fn logical_key(group: &str, sender: &str, author: &str, logical: uuid::Uuid) -> 
 }
 
 impl State {
-    fn group_member(&self, email: &str) -> Result<GroupMember> {
-        let member = self.pinned_group_member(email)?;
+    fn group_member(&self, account_id: &str) -> Result<GroupMember> {
+        let member = self.pinned_group_member(account_id)?;
         ensure!(
-            self.group_identity_warnings.get(email) != Some(&member.fingerprint),
+            self.group_identity_warnings.get(account_id) != Some(&member.fingerprint),
             "group_verification_required"
         );
         Ok(member)
     }
-    fn pinned_group_member(&self, email: &str) -> Result<GroupMember> {
-        let key = if email == self.email {
+    fn pinned_group_member(&self, account_id: &str) -> Result<GroupMember> {
+        let key = if account_id == self.account_id {
             &self.upload.identity_key
         } else {
-            ensure!(self.verified.contains(email), "group_verification_required");
+            ensure!(
+                self.verified.contains(account_id),
+                "group_verification_required"
+            );
             self.identities
                 .known
-                .get(email)
+                .get(account_id)
                 .ok_or_else(|| anyhow::anyhow!("group_verification_required"))?
         };
         Ok(GroupMember {
-            email: email.to_owned(),
+            account_id: account_id.to_owned(),
             fingerprint: fingerprint(key)?,
         })
     }
     fn group_is_current(&self, group: &Group) -> bool {
         !group.blocked
             && group.members.iter().all(|member| {
-                self.group_member(&member.email)
+                self.group_member(&member.account_id)
                     .is_ok_and(|current| current == *member)
             })
     }
@@ -263,16 +269,16 @@ impl State {
             proposed.groups.len() < MAX_GROUPS,
             "Group capacity reached."
         );
-        let mut roster = vec![proposed.group_member(&proposed.email)?];
-        let mut seen = BTreeSet::from([proposed.email.clone()]);
-        for email in members {
+        let mut roster = vec![proposed.group_member(&proposed.account_id)?];
+        let mut seen = BTreeSet::from([proposed.account_id.clone()]);
+        for account_id in members {
             ensure!(
-                normalized(email)? == *email && seen.insert(email.clone()),
+                normalized(account_id)? == *account_id && seen.insert(account_id.clone()),
                 "Invalid group title or members."
             );
-            roster.push(proposed.group_member(email)?);
+            roster.push(proposed.group_member(account_id)?);
         }
-        roster.sort_by(|a, b| a.email.cmp(&b.email));
+        roster.sort_by(|a, b| a.account_id.cmp(&b.account_id));
         let tokens = sorted_tokens(&roster)?;
         let mut nonce = [0; 16];
         rand::rngs::OsRng.unwrap_err().fill_bytes(&mut nonce);
@@ -309,13 +315,13 @@ impl State {
             group
                 .members
                 .iter()
-                .any(|member| member.email == proposed.email),
+                .any(|member| member.account_id == proposed.account_id),
             SECURITY_ALERT
         );
         let recipients: Vec<_> = group
             .members
             .iter()
-            .filter(|member| member.email != proposed.email)
+            .filter(|member| member.account_id != proposed.account_id)
             .collect();
         ensure!(
             proposed.outbox.len() + recipients.len() <= 16,
@@ -325,11 +331,11 @@ impl State {
         let logical = uuid::Uuid::new_v4();
         let plaintext = group_frame(&group, logical, expires_at, text)?;
         let author = fingerprint(&proposed.upload.identity_key)?;
-        let message_id = row_id(id, &proposed.email, &author, logical);
+        let message_id = row_id(id, &proposed.account_id, &author, logical);
         let mut requests = Vec::new();
         for member in &recipients {
             let request = proposed
-                .encrypt_frame(&member.email, &plaintext, expires_at)
+                .encrypt_frame(&member.account_id, &plaintext, expires_at)
                 .await?;
             proposed.group_outbox.insert(
                 request.id.clone(),
@@ -337,15 +343,15 @@ impl State {
                     id: request.id.clone(),
                     group_id: id.to_owned(),
                     message_id: message_id.clone(),
-                    recipient: member.email.clone(),
+                    recipient: member.account_id.clone(),
                 },
             );
             requests.push(request);
         }
         proposed.record(LocalMessage {
             id: message_id,
-            sender: proposed.email.clone(),
-            recipient: proposed.email.clone(),
+            sender: proposed.account_id.clone(),
+            recipient: proposed.account_id.clone(),
             text: Some(text.to_owned()),
             security_alert: None,
             duplicate: false,
@@ -365,17 +371,22 @@ impl State {
         *self = proposed;
         Ok(requests)
     }
-    pub fn block_groups_for_contact(&mut self, email: &str) -> Result<()> {
-        self.block_groups_for_contact_if_pin(email, None)
+    pub fn block_groups_for_contact(&mut self, account_id: &str) -> Result<()> {
+        self.block_groups_for_contact_if_pin(account_id, None)
     }
     pub fn block_groups_for_contact_if_pin(
         &mut self,
-        email: &str,
+        account_id: &str,
         expected: Option<&str>,
     ) -> Result<()> {
-        let email = normalized(email)?;
-        ensure!(self.has_contact(&email), "Add the contact first.");
-        let pin = fingerprint(self.identities.known.get(&email).expect("checked contact"))?;
+        let account_id = normalized(account_id)?;
+        ensure!(self.has_contact(&account_id), "Add the contact first.");
+        let pin = fingerprint(
+            self.identities
+                .known
+                .get(&account_id)
+                .expect("checked contact"),
+        )?;
         if let Some(expected) = expected {
             ensure!(
                 expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -385,19 +396,19 @@ impl State {
                 return Ok(());
             }
         }
-        self.invalidate_groups_for_peer(&email, &pin);
+        self.invalidate_groups_for_peer(&account_id, &pin);
         Ok(())
     }
-    pub(super) fn invalidate_groups_for_peer(&mut self, email: &str, pin: &str) {
-        self.invalidate_traffic_peer(email);
+    pub(super) fn invalidate_groups_for_peer(&mut self, account_id: &str, pin: &str) {
+        self.invalidate_traffic_peer(account_id);
         self.group_identity_warnings
-            .insert(email.to_owned(), pin.to_owned());
+            .insert(account_id.to_owned(), pin.to_owned());
         let mut ids = BTreeSet::new();
         for group in self.groups.values_mut() {
             if group
                 .members
                 .iter()
-                .any(|member| member.email == email && member.fingerprint == pin)
+                .any(|member| member.account_id == account_id && member.fingerprint == pin)
             {
                 group.blocked = true;
                 ids.insert(group.id.clone());
@@ -423,19 +434,19 @@ impl State {
             }
         }
         self.deferred_groups
-            .retain(|entry| entry.sender != email && !ids.contains(&entry.group_id));
+            .retain(|entry| entry.sender != account_id && !ids.contains(&entry.group_id));
     }
     pub(super) fn drop_deferred_for_removed_member(
         &mut self,
-        email: &str,
+        account_id: &str,
         pin: &str,
     ) -> Result<()> {
         let token = member_token(&GroupMember {
-            email: email.to_owned(),
+            account_id: account_id.to_owned(),
             fingerprint: pin.to_owned(),
         })?;
         self.deferred_groups.retain(|entry| {
-            entry.sender != email
+            entry.sender != account_id
                 && decode(&entry.frame)
                     .ok()
                     .and_then(|bytes| {
@@ -449,8 +460,8 @@ impl State {
     }
     fn resolve_tokens(&self, tokens: &[[u8; 32]]) -> Result<Option<Vec<GroupMember>>> {
         let mut known = BTreeMap::new();
-        for email in std::iter::once(&self.email).chain(self.verified.iter()) {
-            let Ok(member) = self.group_member(email) else {
+        for account_id in std::iter::once(&self.account_id).chain(self.verified.iter()) {
+            let Ok(member) = self.group_member(account_id) else {
                 continue;
             };
             ensure!(
@@ -465,7 +476,7 @@ impl State {
             };
             members.push(member.clone());
         }
-        members.sort_by(|a, b| a.email.cmp(&b.email));
+        members.sort_by(|a, b| a.account_id.cmp(&b.account_id));
         Ok(Some(members))
     }
     fn group_message(
@@ -482,21 +493,21 @@ impl State {
             current,
         } = receipt;
         let parsed = parse_group(bytes, current)?;
-        let own_token = member_token(&self.group_member(&self.email)?)?;
+        let own_token = member_token(&self.group_member(&self.account_id)?)?;
         let author_token = member_token(&GroupMember {
-            email: sender.to_owned(),
+            account_id: sender.to_owned(),
             fingerprint: author.to_owned(),
         })?;
         ensure!(
             parsed.tokens.contains(&own_token)
                 && parsed.tokens.contains(&author_token)
-                && sender != self.email,
+                && sender != self.account_id,
             SECURITY_ALERT
         );
         let mut message = LocalMessage {
             id: row_id(&parsed.id, sender, author, parsed.logical_id),
             sender: sender.to_owned(),
-            recipient: self.email.clone(),
+            recipient: self.account_id.clone(),
             text: None,
             security_alert: None,
             duplicate: false,
@@ -646,7 +657,7 @@ impl State {
             .filter(|group| {
                 group.blocked
                     && group.members.iter().all(|member| {
-                        self.pinned_group_member(&member.email)
+                        self.pinned_group_member(&member.account_id)
                             .is_ok_and(|pin| pin == *member)
                     })
             })

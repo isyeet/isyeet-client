@@ -1,5 +1,110 @@
 use super::*;
 
+#[cfg(not(feature = "device-linking"))]
+#[test]
+fn default_build_preserves_authority_watermarks_without_exposing_device_operations() {
+    let state = futures::executor::block_on(State::initialize(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "alice",
+    ))
+    .unwrap();
+    let mut serialized = serde_json::to_value(state).unwrap();
+    let sidecar = json!({"version":1,"allocated_version":19,"allocated_device_id":8,"unknown_future_field":["preserve",true]});
+    serialized["device_authority"] = sidecar.clone();
+    let response: Value = serde_json::from_str(&call(
+        &json!({"op":"snapshot","state":serialized}).to_string(),
+    ))
+    .unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["state"]["device_authority"], sidecar);
+    for op in [
+        "device_authority_snapshot",
+        "device_authority_prepare",
+        "device_authority_approve",
+        "device_candidate_create",
+    ] {
+        let rejected: Value = serde_json::from_str(&call(
+            &json!({"op":op,"state":response["state"]}).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(rejected["ok"], false);
+        assert!(rejected.get("state").is_none());
+    }
+}
+
+#[test]
+fn uuid_identity_and_username_metadata_are_separate_and_cannot_redirect_contacts() {
+    futures::executor::block_on(async {
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "alice")
+            .await
+            .unwrap();
+        let bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "bob")
+            .await
+            .unwrap();
+        alice.add_contact(bundle(&bob)).await.unwrap();
+        assert_eq!(alice.contact_id("bob").unwrap(), bob.account_id);
+        assert_eq!(alice.contact_id("@bob").unwrap(), bob.account_id);
+        assert_eq!(alice.contact_id("alice").unwrap(), alice.account_id);
+        assert!(alice.contact_id("Bob").is_err());
+        assert!(
+            alice
+                .encrypt("bob", "not a protocol address")
+                .await
+                .is_err()
+        );
+        let before_pin = alice.identities.known.clone();
+        let before_sessions = alice.sessions.0.clone();
+        let mut renamed = bundle(&bob);
+        renamed.username = "mallory".into();
+        assert!(alice.add_contact(renamed).await.is_err());
+        let impostor = State::initialize("aa957ded-a93d-4de8-bb7a-f495af5c7e5c", "bob")
+            .await
+            .unwrap();
+        assert!(alice.add_contact(bundle(&impostor)).await.is_err());
+        assert_eq!(alice.contact_id("bob").unwrap(), bob.account_id);
+        assert_eq!(alice.identities.known, before_pin);
+        assert_eq!(alice.sessions.0, before_sessions);
+        let snapshot = alice.snapshot().unwrap();
+        assert_eq!(snapshot["username"], "alice");
+        assert_eq!(snapshot["contacts"][0]["account_id"], bob.account_id);
+        assert_eq!(snapshot["contacts"][0]["username"], "bob");
+    });
+}
+
+#[test]
+fn invalid_or_mixed_identity_schemas_reject_before_releasing_private_state() {
+    let mixed = futures::executor::block_on(async {
+        let valid = "0beaac69-d53e-48d2-b5aa-dd405b7f414d";
+        for account in [
+            "alice@gmail.com",
+            "alice",
+            "0BEAAC69-D53E-48D2-B5AA-DD405B7F414D",
+            "00000000-0000-1000-8000-000000000001",
+        ] {
+            assert!(State::initialize(account, "alice").await.is_err());
+        }
+        for username in [
+            "AlIce",
+            "ab",
+            "alice@example",
+            "alice\n",
+            "alice\u{202e}",
+            "_alice",
+        ] {
+            assert!(State::initialize(valid, username).await.is_err());
+        }
+        let state = State::initialize(valid, "alice").await.unwrap();
+        let mut mixed = serde_json::to_value(&state).unwrap();
+        mixed["sessions"]["old@gmail.com"] = json!("secret-state");
+        mixed
+    });
+    let result: Value =
+        serde_json::from_str(&call(&json!({"op":"snapshot","state":mixed}).to_string())).unwrap();
+    assert_eq!(result["ok"], false);
+    assert!(result.get("state").is_none());
+    assert!(!result.to_string().contains("secret-state"));
+}
+
 pub(super) fn bundle(state: &State) -> KeyBundle {
     let upload = state.key_upload();
     let pre_key = upload
@@ -8,7 +113,8 @@ pub(super) fn bundle(state: &State) -> KeyBundle {
         .find(|key| state.prekeys.0.contains_key(&key.id))
         .cloned();
     KeyBundle {
-        email: state.email.clone(),
+        account_id: state.account_id.clone(),
+        username: state.username.clone(),
         registration_id: upload.registration_id,
         identity_key: upload.identity_key,
         signed_pre_key: upload.signed_pre_key,
@@ -20,10 +126,13 @@ pub(super) async fn connect(alice: &mut State, bob: &mut State) {
     alice.add_contact(bundle(bob)).await.unwrap();
     bob.add_contact(bundle(alice)).await.unwrap();
     alice
-        .verify_contact(&bob.email, &fingerprint(&bob.upload.identity_key).unwrap())
+        .verify_contact(
+            &bob.account_id,
+            &fingerprint(&bob.upload.identity_key).unwrap(),
+        )
         .unwrap();
     bob.verify_contact(
-        &alice.email,
+        &alice.account_id,
         &fingerprint(&alice.upload.identity_key).unwrap(),
     )
     .unwrap();
@@ -31,7 +140,7 @@ pub(super) async fn connect(alice: &mut State, bob: &mut State) {
 pub(super) fn incoming(sender: &State, message: SendRequest) -> QueuedMessage {
     QueuedMessage {
         id: message.id,
-        sender: sender.email.clone(),
+        sender: sender.account_id.clone(),
         envelope: message.envelope,
         created_at: 0,
     }
@@ -64,15 +173,23 @@ fn every_disallowed_byte_rejected_before_string() {
 #[test]
 fn signal_roundtrip_restart_reordering_duplicates_and_verification() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         alice.add_contact(bundle(&bob)).await.unwrap();
-        assert!(alice.encrypt(&bob.email, "blocked").await.is_err());
-        assert!(alice.verify_contact(&bob.email, &"00".repeat(32)).is_err());
+        assert!(alice.encrypt(&bob.account_id, "blocked").await.is_err());
+        assert!(
+            alice
+                .verify_contact(&bob.account_id, &"00".repeat(32))
+                .is_err()
+        );
         connect(&mut alice, &mut bob).await;
         for round in 0..24 {
             let expected = format!("ASCII message {round}: **literal**, https://literal.example");
-            let message = alice.encrypt(&bob.email, &expected).await.unwrap();
+            let message = alice.encrypt(&bob.account_id, &expected).await.unwrap();
             assert_eq!(decode(&message.envelope).unwrap().len(), ENVELOPE_BYTES);
             alice = restart(alice);
             assert_eq!(alice.outbox.last().unwrap().envelope, message.envelope);
@@ -82,7 +199,7 @@ fn signal_roundtrip_restart_reordering_duplicates_and_verification() {
             bob = restart(bob);
             assert!(bob.decrypt(queued).await.unwrap().duplicate);
             alice.sent(&message.id).unwrap();
-            let response = bob.encrypt(&alice.email, "Reply").await.unwrap();
+            let response = bob.encrypt(&alice.account_id, "Reply").await.unwrap();
             bob.sent(&response.id).unwrap();
             assert_eq!(
                 alice
@@ -94,8 +211,8 @@ fn signal_roundtrip_restart_reordering_duplicates_and_verification() {
                 Some("Reply")
             );
         }
-        let first = alice.encrypt(&bob.email, "first").await.unwrap();
-        let second = alice.encrypt(&bob.email, "second").await.unwrap();
+        let first = alice.encrypt(&bob.account_id, "first").await.unwrap();
+        let second = alice.encrypt(&bob.account_id, "second").await.unwrap();
         assert_eq!(
             bob.decrypt(incoming(&alice, second))
                 .await
@@ -112,17 +229,23 @@ fn signal_roundtrip_restart_reordering_duplicates_and_verification() {
                 .as_deref(),
             Some("first")
         );
-        let changed_bob = State::initialize("bob@gmail.com").await.unwrap();
+        let changed_bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         assert!(alice.add_contact(bundle(&changed_bob)).await.is_err());
     });
 }
 #[test]
 fn malformed_or_unauthenticated_messages_alert_without_destroying_session() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
-        let message = alice.encrypt(&bob.email, "survives").await.unwrap();
+        let message = alice.encrypt(&bob.account_id, "survives").await.unwrap();
         let mut corrupted = incoming(&alice, message.clone());
         corrupted.id = uuid::Uuid::new_v4().to_string();
         let mut bytes = decode(&corrupted.envelope).unwrap();
@@ -145,8 +268,8 @@ fn malformed_or_unauthenticated_messages_alert_without_destroying_session() {
         invalid[15] = 0x1b;
         let cipher = message_encrypt(
             &invalid,
-            &address(&bob.email),
-            &address(&alice.email),
+            &address(&bob.account_id),
+            &address(&alice.account_id),
             &mut alice.sessions,
             &mut alice.identities,
             SystemTime::now(),
@@ -162,7 +285,7 @@ fn malformed_or_unauthenticated_messages_alert_without_destroying_session() {
         let rejected = bob
             .decrypt(QueuedMessage {
                 id: uuid::Uuid::new_v4().to_string(),
-                sender: alice.email.clone(),
+                sender: alice.account_id.clone(),
                 envelope: encode(envelope),
                 created_at: 0,
             })
@@ -170,7 +293,10 @@ fn malformed_or_unauthenticated_messages_alert_without_destroying_session() {
             .unwrap();
         assert!(rejected.security_alert.is_some());
         assert!(rejected.text.is_none());
-        let good = alice.encrypt(&bob.email, "after invalid").await.unwrap();
+        let good = alice
+            .encrypt(&bob.account_id, "after invalid")
+            .await
+            .unwrap();
         assert_eq!(
             bob.decrypt(incoming(&alice, good))
                 .await
@@ -186,9 +312,11 @@ fn failed_ffi_request_never_returns_proposed_state_or_echoes_plaintext() {
     let value: Value = serde_json::from_str(&call("{bad")).unwrap();
     assert_eq!(value["ok"], false);
     assert!(value.get("state").is_none());
-    let init: Value =
-        serde_json::from_str(&call(r#"{"op":"init","email":"test@gmail.com"}"#)).unwrap();
-    let rejected: Value = serde_json::from_str(&call(&json!({"op":"encrypt","state":init["state"],"recipient":"other@gmail.com","text":"secret"}).to_string())).unwrap();
+    let init: Value = serde_json::from_str(&call(
+        r#"{"op":"init","account_id":"87924606-b413-4a8a-8eee-ae8868531fbb","username":"test"}"#,
+    ))
+    .unwrap();
+    let rejected: Value = serde_json::from_str(&call(&json!({"op":"encrypt","state":init["state"],"recipient":"18ae18f2-64c2-4442-a0aa-fe2ef8d2d130","text":"secret"}).to_string())).unwrap();
     assert_eq!(rejected["ok"], false);
     assert!(!rejected.to_string().contains("secret"));
 }
@@ -233,12 +361,16 @@ fn authenticated_deadline_boundaries_and_future_clock_limits() {
 #[test]
 fn expiry_prunes_plaintext_and_pending_ciphertext_without_touching_crypto() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
         let current = current_time().unwrap() + 1;
         let sent = alice
-            .encrypt_at(&bob.email, "delete on time", current)
+            .encrypt_at(&bob.account_id, "delete on time", current)
             .await
             .unwrap();
         let identity = serde_json::to_value(&alice.identities).unwrap();
@@ -268,12 +400,16 @@ fn expiry_prunes_plaintext_and_pending_ciphertext_without_touching_crypto() {
 #[test]
 fn delayed_expired_ciphertext_consumes_ratchet_without_alert_or_plaintext() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
         let current = current_time().unwrap() + 1;
         let message = alice
-            .encrypt_at(&bob.email, "never display late", current)
+            .encrypt_at(&bob.account_id, "never display late", current)
             .await
             .unwrap();
         let expires_at = message.expires_at;
@@ -293,7 +429,7 @@ fn delayed_expired_ciphertext_consumes_ratchet_without_alert_or_plaintext() {
         assert!(replay.duplicate && replay.text.is_none() && replay.security_alert.is_none());
         assert_eq!(serde_json::to_value(&bob.received).unwrap(), tombstone);
         let live = alice
-            .encrypt_at(&bob.email, "after expired", expires_at + 60)
+            .encrypt_at(&bob.account_id, "after expired", expires_at + 60)
             .await
             .unwrap();
         let live = bob
@@ -316,7 +452,7 @@ pub(super) async fn signal_frame(
     let cipher = message_encrypt(
         plaintext,
         &address(recipient),
-        &address(&alice.email),
+        &address(&alice.account_id),
         &mut alice.sessions,
         &mut alice.identities,
         SystemTime::now(),
@@ -331,7 +467,7 @@ pub(super) async fn signal_frame(
     envelope[6..6 + cipher.serialize().len()].copy_from_slice(cipher.serialize());
     QueuedMessage {
         id: uuid::Uuid::new_v4().to_string(),
-        sender: alice.email.clone(),
+        sender: alice.account_id.clone(),
         envelope: encode(envelope),
         created_at: 0,
     }
@@ -340,20 +476,27 @@ pub(super) async fn signal_frame(
 #[test]
 fn authenticated_undated_legacy_frame_is_silently_consumed() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
         let mut legacy = vec![0; PLAINTEXT_FRAME_BYTES];
         legacy[..4].copy_from_slice(b"ISY1");
         legacy[4..6].copy_from_slice(&6u16.to_be_bytes());
         legacy[6..12].copy_from_slice(b"legacy");
-        let queued = signal_frame(&mut alice, &bob.email, &legacy).await;
+        let queued = signal_frame(&mut alice, &bob.account_id, &legacy).await;
         let result = bob.decrypt(queued.clone()).await.unwrap();
         assert!(result.expired && result.text.is_none() && result.security_alert.is_none());
         assert!(bob.messages.is_empty());
         bob = restart(bob);
         assert!(bob.decrypt(queued).await.unwrap().duplicate);
-        let valid = alice.encrypt(&bob.email, "new protocol").await.unwrap();
+        let valid = alice
+            .encrypt(&bob.account_id, "new protocol")
+            .await
+            .unwrap();
         assert_eq!(
             bob.decrypt(incoming(&alice, valid))
                 .await
@@ -368,11 +511,15 @@ fn authenticated_undated_legacy_frame_is_silently_consumed() {
 #[test]
 fn snapshot_and_history_never_expose_expired_material() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
         alice
-            .encrypt(&bob.email, "secret-expired-test")
+            .encrypt(&bob.account_id, "secret-expired-test")
             .await
             .unwrap();
         let expired = current_time().unwrap();
@@ -393,76 +540,28 @@ fn snapshot_and_history_never_expose_expired_material() {
 }
 
 #[test]
-fn legacy_migration_discards_undated_content_preserving_identity_and_sessions() {
+fn pre_username_states_are_rejected_without_migrating_private_material() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
-        connect(&mut alice, &mut bob).await;
-        let outgoing = alice
-            .encrypt(&bob.email, "legacy-local-secret")
+        let state = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "alice")
             .await
             .unwrap();
-        let received = bob.decrypt(incoming(&alice, outgoing)).await.unwrap();
-        assert!(received.text.is_some());
-        let mut legacy = serde_json::to_value(&alice).unwrap();
-        legacy["version"] = json!(1);
-        legacy.as_object_mut().unwrap().remove("last_observed_at");
-        for message in legacy["messages"].as_array_mut().unwrap() {
-            message.as_object_mut().unwrap().remove("expires_at");
-            message.as_object_mut().unwrap().remove("expired");
+        for version in 1..=6 {
+            let mut old = serde_json::to_value(&state).unwrap();
+            old["version"] = json!(version);
+            let mut loaded: State = serde_json::from_value(old.clone()).unwrap();
+            let before = serde_json::to_value(&loaded).unwrap();
+            assert!(loaded.expire().is_err());
+            assert_eq!(serde_json::to_value(&loaded).unwrap(), before);
+            assert!(
+                dispatch(json!({"op":"snapshot","state":old}))
+                    .await
+                    .is_err()
+            );
         }
-        for message in legacy["outbox"].as_array_mut().unwrap() {
-            message.as_object_mut().unwrap().remove("expires_at");
-        }
-        legacy["received"] = json!(["bob@gmail.com:00000000-0000-4000-8000-000000000001"]);
-        let mut migrated: State = serde_json::from_value(legacy.clone()).unwrap();
-        let current = current_time().unwrap();
-        assert!(migrated.expire_at(current).unwrap());
-        assert_eq!(migrated.version, 6);
-        assert!(migrated.messages.is_empty() && migrated.outbox.is_empty());
-        let serialized = serde_json::to_value(&migrated).unwrap();
-        assert!(!serialized.to_string().contains("legacy-local-secret"));
-        for field in [
-            "email",
-            "identities",
-            "sessions",
-            "prekeys",
-            "signed",
-            "kyber",
-            "upload",
-            "verified",
-        ] {
-            assert_eq!(serialized[field], legacy[field], "changed {field}");
-        }
-        let dedupe = serialized["received"].clone();
-        migrated = restart(migrated);
-        assert!(!migrated.expire_at(current).unwrap());
-        migrated.expire_at(current + 60).unwrap();
-        assert_eq!(serde_json::to_value(&migrated).unwrap()["received"], dedupe);
-        migrated
-            .expire_at(current + MESSAGE_LIFETIME_SECONDS)
-            .unwrap();
-        assert!(migrated.received.is_empty());
-        // Migration never replaces ratchets: the next real message still works.
-        let next = migrated
-            .encrypt_at(
-                &bob.email,
-                "after upgrade",
-                current + MESSAGE_LIFETIME_SECONDS,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            bob.decrypt_at(
-                incoming(&migrated, next),
-                current + MESSAGE_LIFETIME_SECONDS
-            )
-            .await
-            .unwrap()
-            .text
-            .as_deref(),
-            Some("after upgrade")
-        );
+        let mut email_state = serde_json::to_value(&state).unwrap();
+        email_state.as_object_mut().unwrap().remove("account_id");
+        email_state["email"] = json!("alice@gmail.com");
+        assert!(serde_json::from_value::<State>(email_state).is_err());
     });
 }
 
@@ -485,24 +584,30 @@ fn malformed_legacy_ascii_is_rejected_without_decoding() {
 #[test]
 fn replacement_rejects_bad_proof_or_bundle_without_any_state_mutation() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
         alice
-            .encrypt(&bob.email, "pending old session")
+            .encrypt(&bob.account_id, "pending old session")
             .await
             .unwrap();
         // Even expiry pruning on a rejected public operation must stay on its clone.
         alice.messages[0].expires_at = 1;
         alice.outbox[0].expires_at = 1;
-        let replacement = State::initialize(&bob.email).await.unwrap();
+        let replacement = State::initialize(&bob.account_id, &bob.username)
+            .await
+            .unwrap();
         let old = fingerprint(&bob.upload.identity_key).unwrap();
         let new = fingerprint(&replacement.upload.identity_key).unwrap();
         let fresh = bundle(&replacement);
-        let mut wrong_email = fresh.clone();
-        wrong_email.email = "eve@gmail.com".into();
-        let mut alias_email = fresh.clone();
-        alias_email.email = "b.ob@gmail.com".into();
+        let mut wrong_account = fresh.clone();
+        wrong_account.account_id = "aae74993-71fb-4754-abf1-3581ebd58df8".into();
+        let mut wrong_account_alias = fresh.clone();
+        wrong_account_alias.account_id = "d87b0ce5-f90c-409b-b822-14df2cdcad1e".into();
         let mut bad_ec_signature = fresh.clone();
         let mut signature = decode(&bad_ec_signature.signed_pre_key.signature).unwrap();
         signature[0] ^= 1;
@@ -514,34 +619,84 @@ fn replacement_rejects_bad_proof_or_bundle_without_any_state_mutation() {
         let mut bad_prekey = fresh.clone();
         bad_prekey.signed_pre_key.public_key = encode([0; 33]);
         let cases = [
-            ("bob@gmail.com", fresh.clone(), "00".repeat(32), new.clone()),
-            ("bob@gmail.com", fresh.clone(), old.clone(), "00".repeat(32)),
             (
-                "bob@gmail.com",
+                "300db02d-b75a-4922-8759-f08a0efa5a40",
+                fresh.clone(),
+                "00".repeat(32),
+                new.clone(),
+            ),
+            (
+                "300db02d-b75a-4922-8759-f08a0efa5a40",
+                fresh.clone(),
+                old.clone(),
+                "00".repeat(32),
+            ),
+            (
+                "300db02d-b75a-4922-8759-f08a0efa5a40",
                 fresh.clone(),
                 old[..63].into(),
                 new.clone(),
             ),
-            ("bob@gmail.com", fresh.clone(), old.clone(), "z".repeat(64)),
-            ("bob@gmail.com", bundle(&bob), old.clone(), old.clone()),
-            ("eve@gmail.com", fresh.clone(), old.clone(), new.clone()),
-            ("bob@gmail.com", wrong_email, old.clone(), new.clone()),
-            ("bob@gmail.com", alias_email, old.clone(), new.clone()),
-            ("b.ob@gmail.com", fresh, old.clone(), new.clone()),
-            ("bob@gmail.com", bad_ec_signature, old.clone(), new.clone()),
             (
-                "bob@gmail.com",
+                "300db02d-b75a-4922-8759-f08a0efa5a40",
+                fresh.clone(),
+                old.clone(),
+                "z".repeat(64),
+            ),
+            (
+                "300db02d-b75a-4922-8759-f08a0efa5a40",
+                bundle(&bob),
+                old.clone(),
+                old.clone(),
+            ),
+            (
+                "aae74993-71fb-4754-abf1-3581ebd58df8",
+                fresh.clone(),
+                old.clone(),
+                new.clone(),
+            ),
+            (
+                "300db02d-b75a-4922-8759-f08a0efa5a40",
+                wrong_account,
+                old.clone(),
+                new.clone(),
+            ),
+            (
+                "300db02d-b75a-4922-8759-f08a0efa5a40",
+                wrong_account_alias,
+                old.clone(),
+                new.clone(),
+            ),
+            (
+                "d87b0ce5-f90c-409b-b822-14df2cdcad1e",
+                fresh,
+                old.clone(),
+                new.clone(),
+            ),
+            (
+                "300db02d-b75a-4922-8759-f08a0efa5a40",
+                bad_ec_signature,
+                old.clone(),
+                new.clone(),
+            ),
+            (
+                "300db02d-b75a-4922-8759-f08a0efa5a40",
                 bad_kyber_signature,
                 old.clone(),
                 new.clone(),
             ),
-            ("bob@gmail.com", bad_prekey, old.clone(), new.clone()),
+            (
+                "300db02d-b75a-4922-8759-f08a0efa5a40",
+                bad_prekey,
+                old.clone(),
+                new.clone(),
+            ),
         ];
         let before = serde_json::to_value(&alice).unwrap();
-        for (email, bundle, previous, expected) in cases {
+        for (account_id, bundle, previous, expected) in cases {
             assert_eq!(
                 alice
-                    .replace_contact(email, bundle, &previous, &expected)
+                    .replace_contact(account_id, bundle, &previous, &expected)
                     .await
                     .unwrap_err()
                     .to_string(),
@@ -555,24 +710,30 @@ fn replacement_rejects_bad_proof_or_bundle_without_any_state_mutation() {
 #[test]
 fn verified_replacement_recovers_queued_first_message_and_preserves_other_state() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
-        let mut carol = State::initialize("carol@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
+        let mut carol = State::initialize("c36e0493-49f8-4439-aa4c-2aa333bf235f", "uc36e0493")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
         let current = current_time().unwrap() + 1;
         let old_message = bob
-            .encrypt_at(&alice.email, "old history", current)
+            .encrypt_at(&alice.account_id, "old history", current)
             .await
             .unwrap();
         let old_queued = incoming(&bob, old_message);
         alice.decrypt_at(old_queued.clone(), current).await.unwrap();
         alice
-            .encrypt_at(&bob.email, "old pending", current)
+            .encrypt_at(&bob.account_id, "old pending", current)
             .await
             .unwrap();
         connect(&mut alice, &mut carol).await;
         let other = carol
-            .encrypt_at(&alice.email, "other contact history", current)
+            .encrypt_at(&alice.account_id, "other contact history", current)
             .await
             .unwrap();
         alice
@@ -580,20 +741,22 @@ fn verified_replacement_recovers_queued_first_message_and_preserves_other_state(
             .await
             .unwrap();
         let other_pending = alice
-            .encrypt_at(&carol.email, "other pending", current)
+            .encrypt_at(&carol.account_id, "other pending", current)
             .await
             .unwrap();
 
-        let mut fresh_bob = State::initialize(&bob.email).await.unwrap();
+        let mut fresh_bob = State::initialize(&bob.account_id, &bob.username)
+            .await
+            .unwrap();
         fresh_bob.add_contact(bundle(&alice)).await.unwrap();
         fresh_bob
             .verify_contact(
-                &alice.email,
+                &alice.account_id,
                 &fingerprint(&alice.upload.identity_key).unwrap(),
             )
             .unwrap();
         let first_new = fresh_bob
-            .encrypt_at(&alice.email, "first from new phone", current)
+            .encrypt_at(&alice.account_id, "first from new phone", current)
             .await
             .unwrap();
         let first_queued = incoming(&fresh_bob, first_new);
@@ -615,7 +778,7 @@ fn verified_replacement_recovers_queued_first_message_and_preserves_other_state(
         let new_fingerprint = fingerprint(&fresh_bob.upload.identity_key).unwrap();
         let contact = alice
             .replace_contact(
-                &bob.email,
+                &bob.account_id,
                 bundle(&fresh_bob),
                 &old_fingerprint.to_uppercase(),
                 &new_fingerprint.to_uppercase(),
@@ -624,11 +787,17 @@ fn verified_replacement_recovers_queued_first_message_and_preserves_other_state(
             .unwrap();
         assert_eq!(
             contact,
-            json!({"email":bob.email,"fingerprint":new_fingerprint,"verified":true})
+            json!({"account_id":bob.account_id,"username":bob.username,"fingerprint":new_fingerprint,"verified":true})
         );
         let replaced = serde_json::to_value(&alice).unwrap();
         for field in [
-            "email", "prekeys", "signed", "kyber", "upload", "verified", "received",
+            "account_id",
+            "prekeys",
+            "signed",
+            "kyber",
+            "upload",
+            "verified",
+            "received",
         ] {
             assert_eq!(
                 replaced[field], unchanged[field],
@@ -644,16 +813,16 @@ fn verified_replacement_recovers_queued_first_message_and_preserves_other_state(
             unchanged["identities"]["registration"]
         );
         assert_eq!(
-            replaced["identities"]["known"][&carol.email],
-            unchanged["identities"]["known"][&carol.email]
+            replaced["identities"]["known"][&carol.account_id],
+            unchanged["identities"]["known"][&carol.account_id]
         );
         assert_eq!(
-            replaced["sessions"][&carol.email],
-            unchanged["sessions"][&carol.email]
+            replaced["sessions"][&carol.account_id],
+            unchanged["sessions"][&carol.account_id]
         );
         assert_ne!(
-            replaced["sessions"][&bob.email],
-            unchanged["sessions"][&bob.email]
+            replaced["sessions"][&bob.account_id],
+            unchanged["sessions"][&bob.account_id]
         );
         assert_eq!(alice.outbox.len(), 1);
         assert_eq!(
@@ -664,7 +833,7 @@ fn verified_replacement_recovers_queued_first_message_and_preserves_other_state(
             .as_array()
             .unwrap()
             .iter()
-            .filter(|m| m["sender"] == carol.email || m["recipient"] == carol.email)
+            .filter(|m| m["sender"] == carol.account_id || m["recipient"] == carol.account_id)
             .cloned()
             .collect();
         assert_eq!(replaced["messages"], json!(other_history));
@@ -672,7 +841,7 @@ fn verified_replacement_recovers_queued_first_message_and_preserves_other_state(
         assert!(
             alice
                 .replace_contact(
-                    &bob.email,
+                    &bob.account_id,
                     bundle(&fresh_bob),
                     &old_fingerprint,
                     &new_fingerprint
@@ -699,7 +868,7 @@ fn verified_replacement_recovers_queued_first_message_and_preserves_other_state(
             Some("first from new phone")
         );
         let reply = alice
-            .encrypt_at(&fresh_bob.email, "reply to new phone", current)
+            .encrypt_at(&fresh_bob.account_id, "reply to new phone", current)
             .await
             .unwrap();
         fresh_bob = restart(fresh_bob);
@@ -713,7 +882,7 @@ fn verified_replacement_recovers_queued_first_message_and_preserves_other_state(
             Some("reply to new phone")
         );
         let next = fresh_bob
-            .encrypt_at(&alice.email, "new ratchet works", current)
+            .encrypt_at(&alice.account_id, "new ratchet works", current)
             .await
             .unwrap();
         assert_eq!(
@@ -728,7 +897,7 @@ fn verified_replacement_recovers_queued_first_message_and_preserves_other_state(
 
         // The former identity never becomes trusted again through incoming traffic.
         let stale = bob
-            .encrypt_at(&alice.email, "old identity rejected", current)
+            .encrypt_at(&alice.account_id, "old identity rejected", current)
             .await
             .unwrap();
         let before_stale = serde_json::to_value(&alice).unwrap();
@@ -747,20 +916,26 @@ fn verified_replacement_recovers_queued_first_message_and_preserves_other_state(
 #[test]
 fn replacement_and_identity_change_ffi_failures_return_safe_errors_without_state() {
     let (alice, fresh_bundle, queued, old, new) = futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
         let old = fingerprint(&bob.upload.identity_key).unwrap();
-        let mut fresh = State::initialize(&bob.email).await.unwrap();
+        let mut fresh = State::initialize(&bob.account_id, &bob.username)
+            .await
+            .unwrap();
         fresh.add_contact(bundle(&alice)).await.unwrap();
         fresh
             .verify_contact(
-                &alice.email,
+                &alice.account_id,
                 &fingerprint(&alice.upload.identity_key).unwrap(),
             )
             .unwrap();
         let message = fresh
-            .encrypt(&alice.email, "DO_NOT_ECHO_PLAINTEXT")
+            .encrypt(&alice.account_id, "DO_NOT_ECHO_PLAINTEXT")
             .await
             .unwrap();
         let new = fingerprint(&fresh.upload.identity_key).unwrap();
@@ -774,12 +949,12 @@ fn replacement_and_identity_change_ffi_failures_return_safe_errors_without_state
         changed,
         json!({"ok":false,"error":"contact_identity_changed"})
     );
-    let failed: Value = serde_json::from_str(&call(&json!({"op":"replace_contact","state":alice,"email":"bob@gmail.com","bundle":fresh_bundle,"previous_fingerprint":old,"fingerprint":"DO_NOT_ECHO"}).to_string())).unwrap();
+    let failed: Value = serde_json::from_str(&call(&json!({"op":"replace_contact","state":alice,"account_id":"300db02d-b75a-4922-8759-f08a0efa5a40","bundle":fresh_bundle,"previous_fingerprint":old,"fingerprint":"DO_NOT_ECHO"}).to_string())).unwrap();
     assert_eq!(
         failed,
         json!({"ok":false,"error":CONTACT_REPLACEMENT_REJECTED})
     );
-    let success: Value = serde_json::from_str(&call(&json!({"op":"replace_contact","state":alice,"email":"bob@gmail.com","bundle":fresh_bundle,"previous_fingerprint":old,"fingerprint":new}).to_string())).unwrap();
+    let success: Value = serde_json::from_str(&call(&json!({"op":"replace_contact","state":alice,"account_id":"300db02d-b75a-4922-8759-f08a0efa5a40","bundle":fresh_bundle,"previous_fingerprint":old,"fingerprint":new}).to_string())).unwrap();
     assert_eq!(success["ok"], true);
     assert_eq!(success["data"]["verified"], true);
     assert_eq!(success["data"]["fingerprint"], new);
@@ -788,16 +963,18 @@ fn replacement_and_identity_change_ffi_failures_return_safe_errors_without_state
 #[test]
 fn self_message_uses_real_signal_isolated_stores_and_relay_delivery_only() {
     futures::executor::block_on(async {
-        let mut state = State::initialize("alice@gmail.com").await.unwrap();
+        let mut state = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
         let old_state = serde_json::to_value(&state).unwrap();
         assert!(old_state.get("self_channel").is_none());
         state = restart(state);
         let current = current_time().unwrap() + 1;
-        let own_email = state.email.clone();
+        let own_account = state.account_id.clone();
         let mut queued = Vec::new();
         for n in 0..6 {
             let message = state
-                .encrypt_at(&own_email, &format!("self text {n}"), current)
+                .encrypt_at(&own_account, &format!("self text {n}"), current)
                 .await
                 .unwrap();
             assert_eq!(decode(&message.envelope).unwrap().len(), ENVELOPE_BYTES);
@@ -813,8 +990,8 @@ fn self_message_uses_real_signal_isolated_stores_and_relay_delivery_only() {
             let received = state.decrypt_at(queued[n].clone(), current).await.unwrap();
             assert_eq!(received.text, Some(format!("self text {n}")));
             assert!(received.security_alert.is_none());
-            assert_eq!(received.sender, state.email);
-            assert_eq!(received.recipient, state.email);
+            assert_eq!(received.sender, state.account_id);
+            assert_eq!(received.recipient, state.account_id);
             state = restart(state);
             assert!(
                 state
@@ -827,7 +1004,7 @@ fn self_message_uses_real_signal_isolated_stores_and_relay_delivery_only() {
         }
         for n in 0..24 {
             let message = state
-                .encrypt_at(&own_email, "later self text", current)
+                .encrypt_at(&own_account, "later self text", current)
                 .await
                 .unwrap();
             let id = message.id.clone();
@@ -845,7 +1022,7 @@ fn self_message_uses_real_signal_isolated_stores_and_relay_delivery_only() {
         assert_eq!(state.messages.len(), 30);
         let after = serde_json::to_value(&state).unwrap();
         for field in [
-            "email",
+            "account_id",
             "identities",
             "sessions",
             "prekeys",
@@ -866,25 +1043,31 @@ fn self_message_uses_real_signal_isolated_stores_and_relay_delivery_only() {
 #[test]
 fn self_message_rejects_invalid_ascii_forged_identity_and_corruption() {
     futures::executor::block_on(async {
-        let mut state = State::initialize("alice@gmail.com").await.unwrap();
+        let mut state = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
         let current = current_time().unwrap() + 1;
         state.expire_at(current).unwrap();
         let before = serde_json::to_value(&state).unwrap();
         for text in ["", "line\nbreak", "escape\u{1b}", "unicode\u{202e}"] {
             assert!(
                 state
-                    .encrypt_at("alice@gmail.com", text, current)
+                    .encrypt_at("0beaac69-d53e-48d2-b5aa-dd405b7f414d", text, current)
                     .await
                     .is_err()
             );
             assert_eq!(serde_json::to_value(&state).unwrap(), before);
         }
-        // Canonical own-email aliases use exactly the same local channel.
+        // Only the exact immutable own account ID selects the local channel.
         let valid = state
-            .encrypt_at("A.Lice@GMAIL.com", "self secret not a local echo", current)
+            .encrypt_at(
+                "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
+                "self secret not a local echo",
+                current,
+            )
             .await
             .unwrap();
-        assert_eq!(valid.recipient, state.email);
+        assert_eq!(valid.recipient, state.account_id);
         assert!(
             !serde_json::to_string(&state)
                 .unwrap()
@@ -911,10 +1094,16 @@ fn self_message_rejects_invalid_ascii_forged_identity_and_corruption() {
         );
 
         // An untrusted relay cannot substitute a newly generated identity with
-        // our own email. Self traffic is pinned only to our local private key.
-        let mut impostor = State::initialize("alice@gmail.com").await.unwrap();
+        // our own account_id. Self traffic is pinned only to our local private key.
+        let mut impostor = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
         let forged = impostor
-            .encrypt_at("alice@gmail.com", "forged replacement", current)
+            .encrypt_at(
+                "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
+                "forged replacement",
+                current,
+            )
             .await
             .unwrap();
         let channel = serde_json::to_value(&state.self_channel).unwrap();
@@ -933,8 +1122,8 @@ fn self_message_rejects_invalid_ascii_forged_identity_and_corruption() {
         let mut identities = state.self_identities().await.unwrap();
         let cipher = message_encrypt(
             &invalid,
-            &address(&state.email),
-            &address(&state.email),
+            &address(&state.account_id),
+            &address(&state.account_id),
             &mut state.self_channel.as_mut().unwrap().outgoing,
             &mut identities,
             SystemTime::now(),
@@ -951,7 +1140,7 @@ fn self_message_rejects_invalid_ascii_forged_identity_and_corruption() {
             .decrypt_at(
                 QueuedMessage {
                     id: uuid::Uuid::new_v4().to_string(),
-                    sender: state.email.clone(),
+                    sender: state.account_id.clone(),
                     envelope: encode(envelope),
                     created_at: 0,
                 },
@@ -961,7 +1150,11 @@ fn self_message_rejects_invalid_ascii_forged_identity_and_corruption() {
             .unwrap();
         assert!(rejected.text.is_none() && rejected.security_alert.is_some());
         let next = state
-            .encrypt_at("alice@gmail.com", "after invalid", current)
+            .encrypt_at(
+                "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
+                "after invalid",
+                current,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -979,10 +1172,16 @@ fn self_message_rejects_invalid_ascii_forged_identity_and_corruption() {
 #[test]
 fn self_message_expiry_consumes_ratchet_without_plaintext_or_deadline_extension() {
     futures::executor::block_on(async {
-        let mut state = State::initialize("alice@gmail.com").await.unwrap();
+        let mut state = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
         let current = current_time().unwrap() + 1;
         let message = state
-            .encrypt_at("alice@gmail.com", "expire unseen", current)
+            .encrypt_at(
+                "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
+                "expire unseen",
+                current,
+            )
             .await
             .unwrap();
         let expires_at = message.expires_at;
@@ -1006,7 +1205,11 @@ fn self_message_expiry_consumes_ratchet_without_plaintext_or_deadline_extension(
                 .duplicate
         );
         let next = state
-            .encrypt_at("alice@gmail.com", "after expiry", expires_at + 60)
+            .encrypt_at(
+                "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
+                "after expiry",
+                expires_at + 60,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1024,10 +1227,16 @@ fn self_message_expiry_consumes_ratchet_without_plaintext_or_deadline_extension(
 #[test]
 fn self_session_remains_usable_after_signal_pending_session_timeout() {
     futures::executor::block_on(async {
-        let mut state = State::initialize("alice@gmail.com").await.unwrap();
+        let mut state = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
         let current = current_time().unwrap();
         let first = state
-            .encrypt_at("alice@gmail.com", "queued before aging", current)
+            .encrypt_at(
+                "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
+                "queued before aging",
+                current,
+            )
             .await
             .unwrap();
         let queued = incoming(&state, first);
@@ -1047,8 +1256,8 @@ fn self_session_remains_usable_after_signal_pending_session_timeout() {
             let mut identities = state.self_identities().await.unwrap();
             let cipher = message_encrypt(
                 &bytes,
-                &address(&state.email),
-                &address(&state.email),
+                &address(&state.account_id),
+                &address(&state.account_id),
                 &mut state.self_channel.as_mut().unwrap().outgoing,
                 &mut identities,
                 future,
@@ -1067,7 +1276,7 @@ fn self_session_remains_usable_after_signal_pending_session_timeout() {
                 .decrypt_at(
                     QueuedMessage {
                         id: uuid::Uuid::new_v4().to_string(),
-                        sender: state.email.clone(),
+                        sender: state.account_id.clone(),
                         envelope: encode(envelope),
                         created_at: future_seconds,
                     },
@@ -1091,21 +1300,29 @@ fn self_session_remains_usable_after_signal_pending_session_timeout() {
 #[test]
 fn peer_ciphertext_relabelled_as_self_cannot_mutate_either_channel() {
     futures::executor::block_on(async {
-        let mut alice = State::initialize("alice@gmail.com").await.unwrap();
-        let mut bob = State::initialize("bob@gmail.com").await.unwrap();
+        let mut alice = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+            .await
+            .unwrap();
+        let mut bob = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+            .await
+            .unwrap();
         connect(&mut alice, &mut bob).await;
         let current = current_time().unwrap() + 1;
         let self_message = alice
-            .encrypt_at("alice@gmail.com", "self remains usable", current)
+            .encrypt_at(
+                "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
+                "self remains usable",
+                current,
+            )
             .await
             .unwrap();
         let peer_message = bob
-            .encrypt_at(&alice.email, "real peer message", current)
+            .encrypt_at(&alice.account_id, "real peer message", current)
             .await
             .unwrap();
         let original = incoming(&bob, peer_message);
         let mut relabelled = original.clone();
-        relabelled.sender = alice.email.clone();
+        relabelled.sender = alice.account_id.clone();
         let before = serde_json::to_value(&alice).unwrap();
         let rejected = alice.decrypt_at(relabelled, current).await.unwrap();
         assert!(rejected.text.is_none() && rejected.security_alert.is_some());

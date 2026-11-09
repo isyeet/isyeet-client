@@ -4,15 +4,15 @@ import Testing
 
 private enum ConversationFixture {
     static let now: Int64 = 2_000_000
-    static let me = "alice@gmail.com"
-    static let bob = "bob@gmail.com"
-    static let carol = "carol@gmail.com"
+    static let me = "0beaac69-d53e-48d2-b5aa-dd405b7f414d"
+    static let bob = "300db02d-b75a-4922-8759-f08a0efa5a40"
+    static let carol = "c36e0493-49f8-4439-aa4c-2aa333bf235f"
     static let pin = String(repeating: "1", count: 64)
-    static let contacts = [bob, carol, "dave@gmail.com"].map { Contact(email: $0, fingerprint: pin, verified: true) }
+    static let contacts = [bob, carol, "781e65af-8b81-4d42-9fef-a6bc1253f62f"].map { Contact(account_id: $0, username: testUsername($0), fingerprint: pin, verified: true) }
 
     static func group(_ digit: String = "a", title: String = "Study group", blocked: Bool = false) -> MessageGroup {
         MessageGroup(id: String(repeating: digit, count: 64), title: title,
-                     members: [me, bob, carol].map { .init(email: $0, fingerprint: pin) }, blocked: blocked)
+                     members: [me, bob, carol].map { .init(account_id: $0, fingerprint: pin) }, blocked: blocked)
     }
 
     static func message(sender: String = bob, recipient: String = me, text: String? = "Hello",
@@ -35,7 +35,7 @@ private enum ConversationFixture {
                          groups: [MessageGroup] = [], refs: [OutboxReference] = [], coverIDs: [String] = []) -> Snapshot {
         var traffic = TrafficState()
         traffic.cover_outbox_ids = coverIDs
-        return Snapshot(email: me, fingerprint: pin, contacts: contacts, outbox: outbox,
+        return Snapshot(account_id: me, username: testUsername(me), fingerprint: pin, contacts: contacts, outbox: outbox,
                         messages: messages, groups: groups, outbox_refs: refs, traffic: traffic)
     }
 }
@@ -48,7 +48,7 @@ private enum ConversationFixture {
     let selfMessage = f.message(sender: f.me, text: "Returned through relay", sent: f.now - 10)
     let grouped = f.message(text: "Group only", sent: f.now - 30, group: group.id)
     let unrelated = f.message(sender: f.bob, recipient: f.carol, text: "Never show", sent: f.now)
-    let unknown = f.message(sender: "outsider@gmail.com", text: "Not a contact", sent: f.now)
+    let unknown = f.message(sender: "9fa56b84-e436-4423-8452-b98816524ec5", text: "Not a contact", sent: f.now)
     let snapshot = try f.snapshot(messages: [incoming, selfMessage, grouped, unrelated, unknown, outgoing], groups: [group]).validated()
     let result = snapshot.conversations(unreadCounts: [f.bob: 1, f.me: 99, group.conversationID: 1], at: f.now)
     #expect(result.map(\.id) == [f.bob, f.me, group.conversationID])
@@ -65,7 +65,7 @@ private enum ConversationFixture {
     #expect(result[2].preview == "Group only")
     #expect(result[2].previewSender == f.bob)
     #expect(result[2].unreadCount == 1)
-    #expect(!result.contains { $0.id == f.carol || $0.id == "dave@gmail.com" })
+    #expect(!result.contains { $0.id == f.carol || $0.id == "781e65af-8b81-4d42-9fef-a6bc1253f62f" })
 }
 
 @Test func conversationSummariesExcludeHiddenExpiredDuplicateAndUnrelatedGroupRecords() {
@@ -77,7 +77,7 @@ private enum ConversationFixture {
         f.message(text: "Expired flag", expired: true),
         f.message(text: "Expired boundary", expiry: f.now),
         f.message(text: "Duplicate", duplicate: true),
-        f.message(sender: "outsider@gmail.com", text: "Not a group member", group: group.id),
+        f.message(sender: "9fa56b84-e436-4423-8452-b98816524ec5", text: "Not a group member", group: group.id),
         f.message(recipient: f.carol, text: "Other account's group", group: group.id),
         f.message(text: nil, sent: nil),
     ]
@@ -98,7 +98,7 @@ private enum ConversationFixture {
     let bobLeg = f.outgoing(to: f.bob)
     let carolLeg = f.outgoing(to: f.carol)
     let selfEnvelope = f.outgoing(to: f.me)
-    let cover = f.outgoing(to: "dave@gmail.com")
+    let cover = f.outgoing(to: "781e65af-8b81-4d42-9fef-a6bc1253f62f")
     let logicalID = UUID().uuidString
     let refs = [bobLeg, carolLeg].map {
         OutboxReference(id: $0.id, group_id: group.id, message_id: logicalID, recipient: $0.recipient)

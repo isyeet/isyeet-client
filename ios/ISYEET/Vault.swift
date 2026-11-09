@@ -16,15 +16,18 @@ struct Vault {
         guard status == errSecSuccess, let data = result as? Data, data.count <= 8 * 1024 * 1024 else { throw SafetyError.persistence }
         let stored: StoredAccount
         do { stored = try JSONDecoder().decode(StoredAccount.self, from: data) }
+        catch SafetyError.legacyAccount { throw SafetyError.legacyAccount }
         catch { throw SafetyError.persistence }
-        guard stored.version == 1, try MessageSafety.canonicalEmail(stored.email) == stored.email else { throw SafetyError.persistence }
+        guard stored.version == 2, try MessageSafety.canonicalAccountID(stored.account_id) == stored.account_id else { throw SafetyError.persistence }
         try scope.validate(backend: stored.backend)
         return stored
     }
 
     func save(_ value: StoredAccount) throws {
         try scope.validate(backend: value.backend)
-        guard value.unreadMessageIDs.count <= UnreadMessages.maximumCount else { throw SafetyError.persistence }
+        guard value.version == 2, (try? MessageSafety.canonicalAccountID(value.account_id)) == value.account_id,
+              (try? MessageSafety.canonicalUsername(value.username)) == value.username,
+              value.unreadMessageIDs.count <= UnreadMessages.maximumCount else { throw SafetyError.persistence }
         let data = try JSONEncoder().encode(value)
         guard data.count <= 8 * 1024 * 1024 else { throw SafetyError.persistence }
         // A single Keychain update is the transaction boundary for ratchets, inbox,
@@ -51,6 +54,7 @@ struct Vault {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = result as? Data, data.count <= 8 * 1024 * 1024 else { throw SafetyError.persistence }
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any], object["email"] != nil { throw SafetyError.legacyAccount }
         do {
             let operation = try JSONDecoder().decode(AccountOperation.self, from: data).validated()
             try scope.validate(backend: operation.backend)

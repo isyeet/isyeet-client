@@ -1,28 +1,35 @@
 import Foundation
 
 public enum SafetyError: Error, LocalizedError, Equatable {
-    case deviceIdentityReplaced, accountOperationConflict, trafficUnavailable, invalidText, invalidGroup, invalidEmail, selfContact, invalidFingerprint, staleContactVerification, unchangedFingerprint, unsupportedGoogleAccount, invalidResponse, insecureServer, persistence, configuration, accountMismatch, identityAlreadyRegistered, unauthorized, network
+    case deviceAuthorizationUnavailable, deviceAuthorizationConflict, invalidPairingRequest, deviceIdentityReplaced, accountOperationConflict, trafficUnavailable, invalidText, invalidGroup, invalidAccountID, selfContact, invalidFingerprint, staleContactVerification, unchangedFingerprint, invalidUsername, usernameUnavailable, invalidPasskeyLabel, legacyAccount, passkeyUnavailable, invalidResponse, insecureServer, persistence, configuration, accountMismatch, identityAlreadyRegistered, unauthorized, network
 
     public var errorDescription: String? {
         switch self {
+        case .deviceAuthorizationUnavailable: "Device approval is not enabled in this build. This phone remains the only messaging device."
+        case .deviceAuthorizationConflict: "The device list changed or the approval expired. Refresh before reviewing another request."
+        case .invalidPairingRequest: "The pairing request is invalid or expired. Copy a new complete request from the other device."
         case .deviceIdentityReplaced: "DEVICE REGISTRATION MISSING OR CHANGED. Messaging is stopped. Clear this device only if you intend to re-enroll; contacts must independently verify any new keys."
         case .accountOperationConflict: "The account changed or this operation expired. No new operation was started. Retry the saved operation or contact support."
         case .trafficUnavailable: "The server could not confirm the traffic mode. Cover traffic is paused. Refresh to retry."
         case .invalidText: "Only 1–1024 printable ASCII characters are allowed. No Unicode, newlines, tabs, or control characters."
         case .invalidGroup: "Choose 1–7 independently verified contacts and a group title of 1–48 printable ASCII characters. Membership cannot change."
-        case .invalidEmail: "Enter a Gmail or Google Workspace address without a plus alias."
+        case .invalidAccountID: "The account identifier is invalid. Add a contact by their username."
         case .selfContact: "Use Message yourself on the main screen to test delivery to this device."
         case .invalidFingerprint: "Enter the full 64-character fingerprint obtained from this person outside ISYEET."
         case .staleContactVerification: "This contact's saved verification changed. Close this screen and start again."
         case .unchangedFingerprint: "That is the saved fingerprint. A re-enrolled contact must provide their new fingerprint outside ISYEET."
-        case .unsupportedGoogleAccount: "Choose a verified Gmail or Google Workspace account. Other Google account email addresses are not supported."
+        case .invalidUsername: "Use 3–24 lowercase ASCII letters, numbers or underscores; start with a letter."
+        case .usernameUnavailable: "That username is unavailable. Choose another, or sign in with your existing passkey."
+        case .invalidPasskeyLabel: "Name the passkey using 1–32 printable ASCII characters."
+        case .legacyAccount: "This device contains an earlier email-based account. Version 2 uses usernames and passkeys. Clear the old local account explicitly before creating a new identity. Old keys and contacts cannot migrate."
+        case .passkeyUnavailable: "The passkey request could not be completed. Try again, or use another registered passkey."
         case .invalidResponse: "Security alert: an invalid message or response was rejected."
         case .insecureServer: "An HTTPS server address is required."
         case .persistence: "Secure storage could not be saved. No new message was sent or acknowledged. Unlock your device and try again."
-        case .configuration: "Configure the server address and Google iOS client ID before signing in."
-        case .accountMismatch: "This installation belongs to a different account or server. Sign in with the original Google account."
+        case .configuration: "The service and passkey domain configuration must match before signing in."
+        case .accountMismatch: "This installation belongs to a different account or server. Sign in with the original account’s passkey."
         case .identityAlreadyRegistered: "This account already has a device identity. If you lost that device, choose Re-enroll this device. Your contacts must remove the old contact and independently verify your new keys."
-        case .unauthorized: "Sign in again with the same Google account. Your encryption keys remain on this device."
+        case .unauthorized: "Sign in again with the same account’s passkey. Your encryption keys remain on this device."
         case .network: "The request could not be completed. Refresh when connected to retry pending delivery."
         }
     }
@@ -58,52 +65,19 @@ public enum MessageSafety {
         _ = try decode(Data(text.utf8))
     }
 
-    // Syntax only. Google account authority is checked separately at sign-in.
-    public static func canonicalEmail(_ input: String) throws -> String {
-        guard input.utf8.count <= 254, input.utf8.allSatisfy({ $0 < 128 }) else { throw SafetyError.invalidEmail }
-        let parts = input.lowercased().split(separator: "@", omittingEmptySubsequences: false)
-        guard parts.count == 2, !parts[0].isEmpty, parts[0].utf8.count <= 64,
-              parts[1] != "googlemail.com" else { throw SafetyError.invalidEmail }
-        if parts[1] == "gmail.com" {
-            // Preserve existing Gmail identities, including removal of every dot.
-            guard parts[0].utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 46 }) else {
-                throw SafetyError.invalidEmail
-            }
-            let local = parts[0].replacingOccurrences(of: ".", with: "")
-            guard !local.isEmpty else { throw SafetyError.invalidEmail }
-            return local + "@gmail.com"
-        }
-        guard validEmailDomain(String(parts[1])), !parts[0].hasPrefix("."), !parts[0].hasSuffix("."),
-              !parts[0].contains(".."),
-              parts[0].utf8.allSatisfy({ asciiLetterOrDigit($0) || [46, 95, 45].contains($0) }) else {
-            throw SafetyError.invalidEmail
-        }
-        return parts.joined(separator: "@")
+    public static func canonicalAccountID(_ value: String) throws -> String {
+        guard let id = UUID(uuidString: value), value == id.uuidString.lowercased(),
+              id.uuid.6 >> 4 == 4, id.uuid.8 >> 6 == 2 else { throw SafetyError.invalidAccountID }
+        return value
     }
 
-    // Preflight only: the backend independently verifies the signed Google token.
-    public static func googleAccountEmail(_ email: String, emailVerified: Bool, hostedDomain: String?) throws -> String {
-        guard emailVerified else { throw SafetyError.unsupportedGoogleAccount }
-        let canonical = try canonicalEmail(email)
-        // Workspace secondary domains may differ from the signed hosted domain.
-        guard canonical.hasSuffix("@gmail.com") || hostedDomain.map(validEmailDomain) == true else {
-            throw SafetyError.unsupportedGoogleAccount
+    public static func canonicalUsername(_ value: String) throws -> String {
+        let bytes = Array(value.utf8)
+        guard (3...24).contains(bytes.count), let first = bytes.first, (97...122).contains(first),
+              bytes.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }) else {
+            throw SafetyError.invalidUsername
         }
-        return canonical
-    }
-
-    private static func validEmailDomain(_ domain: String) -> Bool {
-        guard domain.utf8.count <= 253, domain.utf8.allSatisfy({ $0 < 128 }), domain.contains(".") else { return false }
-        return domain.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { label in
-            guard !label.isEmpty, label.utf8.count <= 63,
-                  let first = label.utf8.first, let last = label.utf8.last,
-                  asciiLetterOrDigit(first), asciiLetterOrDigit(last) else { return false }
-            return label.utf8.allSatisfy { asciiLetterOrDigit($0) || $0 == 45 }
-        }
-    }
-
-    private static func asciiLetterOrDigit(_ byte: UInt8) -> Bool {
-        (65...90).contains(byte) || (97...122).contains(byte) || (48...57).contains(byte)
+        return value
     }
 
     public static func serverURL(_ input: String, allowLoopbackHTTP: Bool = false) throws -> URL {
@@ -195,21 +169,22 @@ public enum JSONValue: Codable, Equatable, Sendable {
 }
 
 public struct Contact: Codable, Identifiable, Equatable, Sendable {
-    public let email: String
+    public let account_id: String
+    public let username: String
     public let fingerprint: String
     public let verified: Bool
-    public var id: String { email }
+    public var id: String { account_id }
 }
 
 // Capture the exact old pin when opening a removal confirmation.
 struct ContactRemoval: Identifiable, Equatable, Sendable {
-    let email: String
+    let account_id: String
     let previousFingerprint: String
-    var id: String { email + ":" + previousFingerprint }
-    init(contact: Contact) { email = contact.email; previousFingerprint = contact.fingerprint }
+    var id: String { account_id + ":" + previousFingerprint }
+    init(contact: Contact) { account_id = contact.account_id; previousFingerprint = contact.fingerprint }
     func validate(current: Contact?) throws {
-        guard (try? MessageSafety.canonicalEmail(email)) == email,
-              MessageSafety.validFingerprint(previousFingerprint), current?.email == email,
+        guard (try? MessageSafety.canonicalAccountID(account_id)) == account_id,
+              MessageSafety.validFingerprint(previousFingerprint), current?.account_id == account_id,
               current?.fingerprint == previousFingerprint else { throw SafetyError.staleContactVerification }
     }
 }
@@ -217,12 +192,12 @@ enum ContactRemovalResult: Equatable { case removed, removedPendingSynchronizati
 
 enum AccountOperationKind: String, Codable { case delete, reenroll }
 struct AccountStateResponse: Decodable {
-    let email: String
+    let account_id: String
     let generation: String
     let identity_fingerprint: String?
     let server_time: Int64
-    func validated(email expected: String) throws -> Self {
-        guard email == expected, (try? MessageSafety.canonicalEmail(email)) == email,
+    func validated(account_id expected: String) throws -> Self {
+        guard account_id == expected, (try? MessageSafety.canonicalAccountID(account_id)) == account_id,
               Self.canonicalGeneration(generation), server_time > 0, server_time <= Int64.max - 900,
               identity_fingerprint.map(MessageSafety.validFingerprint) ?? true else { throw SafetyError.invalidResponse }
         return self
@@ -234,18 +209,21 @@ struct AccountStateResponse: Decodable {
 }
 struct AccountCompletion: Decodable {
     let operation_id: String
-    let email: String
+    let account_id: String
     let completed: Bool
     func validate(_ operation: AccountOperation) throws {
-        guard completed, operation_id == operation.operationID, email == operation.email else { throw SafetyError.invalidResponse }
+        guard completed, operation_id == operation.operationID, account_id == operation.account_id else { throw SafetyError.invalidResponse }
     }
 }
-// Separate ThisDeviceOnly Keychain journal. Tokens are never part of this record.
+// Separate ThisDeviceOnly Keychain journal. The narrowly scoped action proof is
+// retained so an uncertain deletion can retrieve its receipt after credentials disappear.
 // Presence locks ordinary messaging until the same operation finishes safely.
 struct AccountOperation: Codable, Equatable {
+    let username: String
+    var actionToken: String
     let kind: AccountOperationKind
     let backend: String
-    let email: String
+    let account_id: String
     let operationID: String
     let expiresAt: Int64
     let expectedGeneration: String
@@ -257,7 +235,9 @@ struct AccountOperation: Codable, Equatable {
     var discardLocal = false
 
     func validated() throws -> Self {
-        guard (try? MessageSafety.canonicalEmail(email)) == email,
+        guard (try? MessageSafety.canonicalAccountID(account_id)) == account_id,
+              (try? MessageSafety.canonicalUsername(username)) == username,
+              !actionToken.isEmpty, actionToken.utf8.count <= 1024, actionToken.utf8.allSatisfy({ (0x21...0x7e).contains($0) }),
               AccountStateResponse.canonicalGeneration(operationID),
               AccountStateResponse.canonicalGeneration(expectedGeneration), expiresAt > 0,
               expectedFingerprint.map(MessageSafety.validFingerprint) ?? true else { throw SafetyError.persistence }
@@ -271,8 +251,8 @@ struct AccountOperation: Codable, Equatable {
         }
         return self
     }
-    func request(idToken: String) -> JSONValue {
-        var fields: [String: JSONValue] = ["id_token": .string(idToken), "operation_id": .string(operationID),
+    func request() -> JSONValue {
+        var fields: [String: JSONValue] = ["action_token": .string(actionToken), "operation_id": .string(operationID),
             "expires_at": .integer(expiresAt), "expected_generation": .string(expectedGeneration),
             "expected_identity_fingerprint": expectedFingerprint.map(JSONValue.string) ?? .null]
         if let keys = preparedKeys { fields["keys"] = keys }
@@ -295,7 +275,7 @@ struct AccountOperation: Codable, Equatable {
 
 public struct MessageGroup: Codable, Identifiable, Equatable, Sendable {
     public struct Member: Codable, Equatable, Sendable {
-        public let email: String
+        public let account_id: String
         public let fingerprint: String
     }
     public let id: String
@@ -385,9 +365,9 @@ public struct StoredMessage: Codable, Identifiable, Equatable, Sendable {
     // A second display guard; the Rust core authenticates and prunes deadlines.
     public func isRetained(at now: Int64) -> Bool { !expired && !deferred && !cover && expires_at > now }
 
-    public func conversationID(accountEmail: String) -> String {
+    public func conversationID(accountID: String) -> String {
         if let group_id { return "group:" + group_id }
-        return sender == accountEmail ? recipient : sender
+        return sender == accountID ? recipient : sender
     }
 
     // Only new authenticated records carry these fields. Do not infer a sent
@@ -518,7 +498,8 @@ public struct KeyMaintenanceState: Codable, Sendable {
 }
 
 public struct Snapshot: Codable, Sendable {
-    public let email: String
+    public let account_id: String
+    public let username: String
     public let fingerprint: String
     public let contacts: [Contact]
     public let outbox: [SendRequest]
@@ -531,17 +512,18 @@ public struct Snapshot: Codable, Sendable {
     public let traffic: TrafficState
     public let key_maintenance: KeyMaintenanceState
 
-    public init(email: String, fingerprint: String, contacts: [Contact], outbox: [SendRequest], messages: [StoredMessage],
+    public init(account_id: String, username: String, fingerprint: String, contacts: [Contact], outbox: [SendRequest], messages: [StoredMessage],
                 groups: [MessageGroup] = [], outbox_refs: [OutboxReference] = [], pending_group_senders: [String] = [], resolved_message_ids: [String] = [], next_expiry: Int64? = nil, traffic: TrafficState = TrafficState(), key_maintenance: KeyMaintenanceState = KeyMaintenanceState()) {
-        self.email = email; self.fingerprint = fingerprint; self.contacts = contacts
+        self.account_id = account_id; self.username = username; self.fingerprint = fingerprint; self.contacts = contacts
         self.outbox = outbox; self.messages = messages; self.groups = groups; self.outbox_refs = outbox_refs
         self.pending_group_senders = pending_group_senders; self.resolved_message_ids = resolved_message_ids; self.next_expiry = next_expiry; self.traffic = traffic; self.key_maintenance = key_maintenance
     }
 
-    private enum CodingKeys: String, CodingKey { case email, fingerprint, contacts, outbox, messages, groups, outbox_refs, pending_group_senders, resolved_message_ids, next_expiry, traffic, key_maintenance }
+    private enum CodingKeys: String, CodingKey { case account_id, username, fingerprint, contacts, outbox, messages, groups, outbox_refs, pending_group_senders, resolved_message_ids, next_expiry, traffic, key_maintenance }
     public init(from decoder: any Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        email = try values.decode(String.self, forKey: .email)
+        account_id = try values.decode(String.self, forKey: .account_id)
+        username = try values.decode(String.self, forKey: .username)
         fingerprint = try values.decode(String.self, forKey: .fingerprint)
         contacts = try values.decode([Contact].self, forKey: .contacts)
         outbox = try values.decode([SendRequest].self, forKey: .outbox)
@@ -564,9 +546,9 @@ public struct Snapshot: Codable, Sendable {
             guard message.isRetained(at: now) else { return false }
             if conversation.hasPrefix("group:") { return message.group_id.map { "group:" + $0 } == conversation }
             guard message.group_id == nil else { return false }
-            if conversation == email { return message.sender == email && message.recipient == email }
-            return (message.sender == email && message.recipient == conversation)
-                || (message.sender == conversation && message.recipient == email)
+            if conversation == account_id { return message.sender == account_id && message.recipient == account_id }
+            return (message.sender == account_id && message.recipient == conversation)
+                || (message.sender == conversation && message.recipient == account_id)
         }
     }
 
@@ -574,7 +556,7 @@ public struct Snapshot: Codable, Sendable {
         let remaining = outbox.filter { $0.expires_at > now }
         var traffic = traffic
         traffic.cover_outbox_ids.removeAll { id in !remaining.contains { $0.id == id } }
-        return Self(email: email, fingerprint: fingerprint, contacts: contacts,
+        return Self(account_id: account_id, username: username, fingerprint: fingerprint, contacts: contacts,
                     outbox: remaining, messages: messages.filter { $0.isRetained(at: now) }, groups: groups,
                     outbox_refs: outbox_refs.filter { ref in remaining.contains { $0.id == ref.id } },
                     pending_group_senders: pending_group_senders, resolved_message_ids: resolved_message_ids,
@@ -586,11 +568,12 @@ public struct Snapshot: Codable, Sendable {
     }
 
     public func validated() throws -> Self {
-        guard try MessageSafety.canonicalEmail(email) == email,
+        guard try MessageSafety.canonicalAccountID(account_id) == account_id,
+              try MessageSafety.canonicalUsername(username) == username,
               MessageSafety.validFingerprint(fingerprint), contacts.count <= 64, outbox.count <= 16,
               messages.count <= 200, groups.count <= 32, outbox_refs.count <= 16,
               pending_group_senders.count <= 64, resolved_message_ids.count <= 64,
-              pending_group_senders.allSatisfy({ (try? MessageSafety.canonicalEmail($0)) == $0 }),
+              pending_group_senders.allSatisfy({ (try? MessageSafety.canonicalAccountID($0)) == $0 }),
               resolved_message_ids.allSatisfy({ UUID(uuidString: $0) != nil }),
               Set(groups.map(\.id)).count == groups.count else { throw SafetyError.invalidResponse }
         guard key_maintenance.next_check_at >= 0 else { throw SafetyError.invalidResponse }
@@ -603,33 +586,34 @@ public struct Snapshot: Codable, Sendable {
         guard (0...4096).contains(traffic.remaining_budget), (0...512).contains(traffic.outstanding),
               traffic.eligible_contacts.count <= 64, traffic.cover_outbox_ids.count <= 1,
               Set(traffic.eligible_contacts).count == traffic.eligible_contacts.count,
-              traffic.eligible_contacts.allSatisfy({ candidate in candidate != email && contacts.contains { $0.email == candidate && $0.verified } }),
+              traffic.eligible_contacts.allSatisfy({ candidate in candidate != account_id && contacts.contains { $0.account_id == candidate && $0.verified } }),
               traffic.cover_outbox_ids.allSatisfy({ id in UUID(uuidString: id) != nil && outbox.contains { $0.id == id } }) else {
             throw SafetyError.invalidResponse
         }
         for contact in contacts {
-            guard try MessageSafety.canonicalEmail(contact.email) == contact.email,
+            guard try MessageSafety.canonicalAccountID(contact.account_id) == contact.account_id,
+                  try MessageSafety.canonicalUsername(contact.username) == contact.username,
                   MessageSafety.validFingerprint(contact.fingerprint) else { throw SafetyError.invalidResponse }
         }
         for group in groups {
             try MessageGroup.validateTitle(group.title)
             guard MessageSafety.validFingerprint(group.id), (2...8).contains(group.members.count),
-                  Set(group.members.map(\.email)).count == group.members.count,
-                  group.members.contains(where: { $0.email == email && $0.fingerprint == fingerprint }) else { throw SafetyError.invalidResponse }
+                  Set(group.members.map(\.account_id)).count == group.members.count,
+                  group.members.contains(where: { $0.account_id == account_id && $0.fingerprint == fingerprint }) else { throw SafetyError.invalidResponse }
             for member in group.members {
-                guard try MessageSafety.canonicalEmail(member.email) == member.email,
+                guard try MessageSafety.canonicalAccountID(member.account_id) == member.account_id,
                       MessageSafety.validFingerprint(member.fingerprint) else { throw SafetyError.invalidResponse }
             }
         }
         for ref in outbox_refs {
             guard UUID(uuidString: ref.id) != nil, UUID(uuidString: ref.message_id) != nil,
                   MessageSafety.validFingerprint(ref.group_id),
-                  try MessageSafety.canonicalEmail(ref.recipient) == ref.recipient else { throw SafetyError.invalidResponse }
+                  try MessageSafety.canonicalAccountID(ref.recipient) == ref.recipient else { throw SafetyError.invalidResponse }
         }
         for message in messages {
             guard UUID(uuidString: message.id) != nil,
-                  try MessageSafety.canonicalEmail(message.sender) == message.sender,
-                  try MessageSafety.canonicalEmail(message.recipient) == message.recipient else { throw SafetyError.invalidResponse }
+                  try MessageSafety.canonicalAccountID(message.sender) == message.sender,
+                  try MessageSafety.canonicalAccountID(message.recipient) == message.recipient else { throw SafetyError.invalidResponse }
             if let text = message.text { try MessageSafety.validate(text) }
             if let id = message.group_id { guard groups.contains(where: { $0.id == id }) else { throw SafetyError.invalidResponse } }
             if let id = message.logical_id { guard UUID(uuidString: id) != nil else { throw SafetyError.invalidResponse } }
@@ -680,17 +664,17 @@ public extension Snapshot {
     /// Preview strings remain literal ASCII. UI must use verbatim text rendering.
     /// Outbox metadata never supplies plaintext or a fabricated activity date.
     func conversations(unreadCounts: [String: Int], at now: Int64) -> [ConversationSummary] {
-        guard (try? MessageSafety.canonicalEmail(email)) == email else { return [] }
+        guard (try? MessageSafety.canonicalAccountID(account_id)) == account_id else { return [] }
         var descriptors: [String: (kind: ConversationKind, title: String, blocked: Bool)] = [
-            email: (.selfMessage, "Message yourself", false),
+            account_id: (.selfMessage, "Message yourself", false),
         ]
-        for contact in contacts where contact.email != email && (try? MessageSafety.canonicalEmail(contact.email)) == contact.email {
-            descriptors[contact.email] = (.direct, contact.email, !contact.verified)
+        for contact in contacts where contact.account_id != account_id && (try? MessageSafety.canonicalAccountID(contact.account_id)) == contact.account_id {
+            descriptors[contact.account_id] = (.direct, "@" + contact.username, !contact.verified)
         }
         var knownGroups: [String: MessageGroup] = [:]
         for group in groups where MessageSafety.validFingerprint(group.id)
             && (try? MessageGroup.validateTitle(group.title)) != nil
-            && group.members.contains(where: { $0.email == email }) {
+            && group.members.contains(where: { $0.account_id == account_id }) {
             descriptors[group.conversationID] = (.group, group.title, group.blocked)
             knownGroups[group.id] = group
         }
@@ -702,12 +686,12 @@ public extension Snapshot {
                   UUID(uuidString: message.id) != nil, seenMessages.insert(message.id).inserted else { continue }
             let conversation: String
             if let groupID = message.group_id {
-                guard let group = knownGroups[groupID], message.recipient == email,
-                      group.members.contains(where: { $0.email == message.sender }) else { continue }
+                guard let group = knownGroups[groupID], message.recipient == account_id,
+                      group.members.contains(where: { $0.account_id == message.sender }) else { continue }
                 conversation = group.conversationID
-            } else if message.sender == email {
+            } else if message.sender == account_id {
                 conversation = message.recipient
-            } else if message.recipient == email {
+            } else if message.recipient == account_id {
                 conversation = message.sender
             } else { continue }
             guard descriptors[conversation] != nil else { continue }
@@ -726,7 +710,7 @@ public extension Snapshot {
                 guard refs.count == 1, let ref = refs.first,
                       ref.recipient == request.recipient, UUID(uuidString: ref.message_id) != nil,
                       let group = knownGroups[ref.group_id],
-                      group.members.contains(where: { $0.email == request.recipient && $0.email != email }) else { continue }
+                      group.members.contains(where: { $0.account_id == request.recipient && $0.account_id != account_id }) else { continue }
                 pending[group.conversationID, default: []].insert(ref.message_id)
             } else if descriptors[request.recipient]?.kind != .group,
                       descriptors[request.recipient] != nil {
@@ -761,7 +745,7 @@ public extension Snapshot {
                 activity = nil
             }
             let unreadEligible = records.filter { message in
-                message.sender != email && message.security_alert == nil
+                message.sender != account_id && message.security_alert == nil
                     && message.text.map { (try? MessageSafety.validate($0)) != nil } == true
             }.count
             return ConversationSummary(id: id, kind: descriptor.kind, title: descriptor.title,
@@ -785,7 +769,8 @@ public extension Snapshot {
 struct StoredAccount: Codable, Equatable {
     let version: Int
     let backend: String
-    let email: String
+    let account_id: String
+    let username: String
     var token: String
     var expiresAt: Int64
     var core: JSONValue
@@ -794,11 +779,12 @@ struct StoredAccount: Codable, Equatable {
     var contactIdentityChanges: [String]
     var identityReplaced: Bool
 
-    init(version: Int, backend: String, email: String, token: String, expiresAt: Int64,
+    init(version: Int, backend: String, account_id: String, username: String, token: String, expiresAt: Int64,
          core: JSONValue, registered: Bool, unreadMessageIDs: [String] = [], contactIdentityChanges: [String] = [], identityReplaced: Bool = false) {
         self.version = version
         self.backend = backend
-        self.email = email
+        self.account_id = account_id
+        self.username = username
         self.token = token
         self.expiresAt = expiresAt
         self.core = core
@@ -809,14 +795,18 @@ struct StoredAccount: Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, backend, email, token, expiresAt, core, registered, unreadMessageIDs, contactIdentityChanges, identityReplaced
+        case version, backend, account_id, username, token, expiresAt, core, registered, unreadMessageIDs, contactIdentityChanges, identityReplaced
     }
 
     init(from decoder: any Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         version = try values.decode(Int.self, forKey: .version)
+        guard version == 2 else { throw SafetyError.legacyAccount }
         backend = try values.decode(String.self, forKey: .backend)
-        email = try values.decode(String.self, forKey: .email)
+        account_id = try values.decode(String.self, forKey: .account_id)
+        username = try values.decode(String.self, forKey: .username)
+        guard (try? MessageSafety.canonicalAccountID(account_id)) == account_id,
+              (try? MessageSafety.canonicalUsername(username)) == username else { throw SafetyError.persistence }
         token = try values.decode(String.self, forKey: .token)
         expiresAt = try values.decode(Int64.self, forKey: .expiresAt)
         core = try values.decode(JSONValue.self, forKey: .core)
@@ -827,7 +817,7 @@ struct StoredAccount: Codable, Equatable {
         identityReplaced = try values.decodeIfPresent(Bool.self, forKey: .identityReplaced) ?? false
         contactIdentityChanges = try values.decodeIfPresent([String].self, forKey: .contactIdentityChanges) ?? []
         guard contactIdentityChanges.count <= 64,
-              contactIdentityChanges.allSatisfy({ (try? MessageSafety.canonicalEmail($0)) == $0 }) else { throw SafetyError.persistence }
+              contactIdentityChanges.allSatisfy({ (try? MessageSafety.canonicalAccountID($0)) == $0 }) else { throw SafetyError.persistence }
     }
 }
 
@@ -848,14 +838,14 @@ enum UnreadMessages {
         let eligible = eligibleMessages(snapshot, now: now)
         var candidates = Set(existing.prefix(maximumCount))
         for arrival in arrivals + [arrival].compactMap({ $0 }) {
-            if isEligible(arrival, accountEmail: snapshot.email, now: now),
+            if isEligible(arrival, accountID: snapshot.account_id, now: now),
                eligible.contains(where: { $0.id == arrival.id && $0.sender == arrival.sender }) {
                 candidates.insert(arrival.id)
             }
         }
         var included = Set<String>()
         return eligible.compactMap { message in
-            guard candidates.contains(message.id), message.conversationID(accountEmail: snapshot.email) != reading.readableConversation,
+            guard candidates.contains(message.id), message.conversationID(accountID: snapshot.account_id) != reading.readableConversation,
                   included.insert(message.id).inserted else { return nil }
             return message.id
         }
@@ -866,20 +856,20 @@ enum UnreadMessages {
         var counted = Set<String>()
         var result: [String: Int] = [:]
         for message in eligibleMessages(snapshot, now: now) where unread.contains(message.id) && counted.insert(message.id).inserted {
-            result[message.conversationID(accountEmail: snapshot.email), default: 0] += 1
+            result[message.conversationID(accountID: snapshot.account_id), default: 0] += 1
         }
         return result
     }
 
     private static func eligibleMessages(_ snapshot: Snapshot, now: Int64) -> [StoredMessage] {
-        snapshot.messages.suffix(maximumCount).filter { isEligible($0, accountEmail: snapshot.email, now: now) }
+        snapshot.messages.suffix(maximumCount).filter { isEligible($0, accountID: snapshot.account_id, now: now) }
     }
 
-    private static func isEligible(_ message: StoredMessage, accountEmail: String, now: Int64) -> Bool {
-        guard message.sender != accountEmail, message.recipient == accountEmail,
+    private static func isEligible(_ message: StoredMessage, accountID: String, now: Int64) -> Bool {
+        guard message.sender != accountID, message.recipient == accountID,
               message.isRetained(at: now),
               !message.duplicate, message.security_alert == nil, UUID(uuidString: message.id) != nil,
-              (try? MessageSafety.canonicalEmail(message.sender)) == message.sender,
+              (try? MessageSafety.canonicalAccountID(message.sender)) == message.sender,
               let text = message.text else { return false }
         return (try? MessageSafety.validate(text)) != nil
     }
@@ -924,5 +914,205 @@ public enum ASCIIFace: String, CaseIterable, Identifiable, Sendable {
         let result = draft + separator + text
         try MessageSafety.validate(result)
         return result
+    }
+}
+
+// Wire formats follow WebAuthn JSON. The app never parses or verifies authenticator
+// signatures: AuthenticationServices creates them and the server verifies them.
+struct PasskeyChallenge: Decodable {
+    let challenge_id: String
+    let account_id: String?
+    let username: String?
+    let public_key: PasskeyOptions
+}
+struct PasskeyOptions: Decodable {
+    struct RelyingParty: Decodable { let id: String; let name: String }
+    struct User: Decodable { let id: String; let name: String; let displayName: String }
+    struct Descriptor: Decodable { let type: String; let id: String }
+    struct Parameter: Decodable { let type: String; let alg: Int }
+    let challenge: String
+    let rp: RelyingParty?
+    let rpId: String?
+    let user: User?
+    let excludeCredentials: [Descriptor]?
+    let allowCredentials: [Descriptor]?
+    let pubKeyCredParams: [Parameter]?
+}
+struct PasskeyAction: Decodable {
+    let action_token: String
+    let expires_at: Int64
+}
+struct RegisteredPasskey: Decodable, Identifiable, Equatable {
+    let id: String
+    let label: String
+    let created_at: Int64
+}
+struct PasskeyList: Decodable {
+    let passkeys: [RegisteredPasskey]
+    let maximum: Int
+}
+struct DirectoryAccount: Decodable {
+    let account_id: String
+    let username: String
+    func validated() throws -> Self {
+        guard (try? MessageSafety.canonicalAccountID(account_id)) == account_id,
+              (try? MessageSafety.canonicalUsername(username)) == username else { throw SafetyError.invalidResponse }
+        return self
+    }
+}
+
+extension Data {
+    var base64URL: String {
+        base64EncodedString().replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    }
+    init?(base64URL: String) {
+        guard !base64URL.isEmpty, base64URL.utf8.count <= 32768,
+              base64URL.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || $0 == 45 || $0 == 95 }) else { return nil }
+        var value = base64URL.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        value += String(repeating: "=", count: (4 - value.count % 4) % 4)
+        self.init(base64Encoded: value)
+        guard self.base64URL == base64URL else { return nil }
+    }
+}
+
+// Deliberately absent from ordinary Debug, Release, and TestFlight builds.
+// Authorization experiments do not enable a second messaging transport.
+enum DeviceAuthorizationFeature {
+    static var enabled: Bool {
+        #if DEBUG && ISYEET_DEVICE_AUTHORIZATION_EXPERIMENT
+        true
+        #else
+        false
+        #endif
+    }
+}
+
+struct DeviceAuthorityResponse: Decodable {
+    let authority: JSONValue?
+    let server_time: Int64
+    let messaging_available: Bool
+
+    func validated(now: Int64 = Int64(Date().timeIntervalSince1970)) throws -> Self {
+        guard !messaging_available, server_time > 0,
+              server_time >= now - 60, server_time <= now + 60 else { throw SafetyError.invalidResponse }
+        return self
+    }
+}
+
+struct DeviceAuthorityReceipt: Codable, Equatable {
+    let operation_id: String
+    let roster_version: UInt64
+    let roster_hash: String
+    let messaging_available: Bool
+
+    func validated() throws -> Self {
+        guard AccountStateResponse.canonicalGeneration(operation_id), roster_version > 0,
+              roster_hash.utf8.count == 64, roster_hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              !messaging_available else { throw SafetyError.invalidResponse }
+        return self
+    }
+}
+
+// These checks bound display data only. The Rust core verifies signatures,
+// transcript binding, expiry, and rollback protection before publishing it.
+enum DevicePairingText {
+    static let maximumBytes = 16_384
+    static func validate(_ code: String, approval: Bool = false) throws {
+        let prefix = approval ? "ISYEET-APPROVAL-1:" : "ISYEET-LINK-1:"
+        guard code.utf8.count <= maximumBytes, code.hasPrefix(prefix),
+              code.utf8.allSatisfy({ (0x21...0x7e).contains($0) }),
+              let decoded = Data(base64URL: String(code.dropFirst(prefix.count))), !decoded.isEmpty else {
+            throw SafetyError.invalidPairingRequest
+        }
+    }
+    static func fingerprint(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) })
+    }
+}
+
+struct DeviceLinkInspection: Decodable, Equatable {
+    let label: String
+    let device_id: UInt32
+    let identity_fingerprint: String
+    let request_hash: String
+    let expires_at: Int64
+    let account_id: String
+    let root_epoch: String
+
+    func validated(accountID: String, now: Int64 = Int64(Date().timeIntervalSince1970)) throws -> Self {
+        guard account_id == accountID, (2...127).contains(device_id),
+              DeviceRosterMember.validLabel(label), DevicePairingText.fingerprint(identity_fingerprint),
+              DevicePairingText.fingerprint(request_hash), expires_at > now, expires_at <= now + 360,
+              !root_epoch.isEmpty, root_epoch.utf8.count <= 128,
+              root_epoch.utf8.allSatisfy({ (0x21...0x7e).contains($0) }) else { throw SafetyError.invalidPairingRequest }
+        return self
+    }
+}
+
+struct DeviceRosterMember: Decodable, Identifiable {
+    struct Certificate: Decodable {
+        let account_id: String
+        let root_epoch: String
+        let device_id: UInt32
+        let identity_key: String
+        let registration_id: UInt32
+        let label: String
+        let request_hash: String
+    }
+    let certificate: Certificate
+    let signature: String
+    var id: UInt32 { certificate.device_id }
+    static func validLabel(_ label: String) -> Bool {
+        (1...32).contains(label.utf8.count) && label.utf8.allSatisfy({ (0x20...0x7e).contains($0) })
+            && label == label.trimmingCharacters(in: .whitespaces) && !label.isEmpty
+    }
+}
+
+struct DeviceSignedRoster: Decodable {
+    struct Roster: Decodable {
+        let origin: String
+        let account_id: String
+        let root_epoch: String
+        let root_identity_key: String
+        let version: UInt64
+        let previous_hash: String
+        let highest_device_id: UInt32
+        let issued_at: Int64
+        let expires_at: Int64
+        let devices: [DeviceRosterMember]
+    }
+    let roster: Roster
+    let signature: String
+
+    func validated(accountID: String, origin: String) throws -> Self {
+        let r = roster
+        guard r.account_id == accountID, r.origin == origin, r.version > 0,
+              (1...127).contains(r.highest_device_id), (1...2).contains(r.devices.count),
+              r.issued_at > 0, r.expires_at > r.issued_at, r.expires_at - r.issued_at <= 86_400,
+              Set(r.devices.map(\.id)).count == r.devices.count,
+              let primary = r.devices.first(where: { $0.id == 1 }), primary.certificate.identity_key == r.root_identity_key,
+              r.devices.allSatisfy({ member in
+                  member.id >= 1 && member.id <= r.highest_device_id && member.certificate.account_id == accountID
+                      && member.certificate.root_epoch == r.root_epoch && DeviceRosterMember.validLabel(member.certificate.label)
+              }) else { throw SafetyError.invalidResponse }
+        return self
+    }
+}
+
+struct DeviceAuthoritySnapshot: Decodable {
+    let authority: DeviceSignedRoster?
+    let pending: JSONValue?
+    let approval_code: String?
+    let messaging_available: Bool
+
+    func validated(accountID: String, origin: String) throws -> Self {
+        guard !messaging_available else { throw SafetyError.invalidResponse }
+        if let authority { _ = try authority.validated(accountID: accountID, origin: origin) }
+        if let approval_code {
+            guard authority != nil, pending == nil else { throw SafetyError.invalidResponse }
+            try DevicePairingText.validate(approval_code, approval: true)
+        }
+        return self
     }
 }

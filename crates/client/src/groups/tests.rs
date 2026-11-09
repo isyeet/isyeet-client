@@ -1,26 +1,46 @@
 use super::*;
 
 #[test]
-fn group_author_namespace_binds_email_even_if_two_accounts_share_a_key() {
+fn group_author_namespace_binds_account_id_even_if_two_accounts_share_a_key() {
     let group = "11".repeat(32);
     let pin = "22".repeat(32);
     let logical = uuid::Uuid::new_v4();
     assert_ne!(
-        row_id(&group, "alice@gmail.com", &pin, logical),
-        row_id(&group, "bob@gmail.com", &pin, logical)
+        row_id(
+            &group,
+            "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
+            &pin,
+            logical
+        ),
+        row_id(
+            &group,
+            "300db02d-b75a-4922-8759-f08a0efa5a40",
+            &pin,
+            logical
+        )
     );
     assert_ne!(
-        logical_key(&group, "alice@gmail.com", &pin, logical),
-        logical_key(&group, "bob@gmail.com", &pin, logical)
+        logical_key(
+            &group,
+            "0beaac69-d53e-48d2-b5aa-dd405b7f414d",
+            &pin,
+            logical
+        ),
+        logical_key(
+            &group,
+            "300db02d-b75a-4922-8759-f08a0efa5a40",
+            &pin,
+            logical
+        )
     );
     assert_ne!(
         member_token(&GroupMember {
-            email: "alice@gmail.com".into(),
+            account_id: "0beaac69-d53e-48d2-b5aa-dd405b7f414d".into(),
             fingerprint: pin.clone()
         })
         .unwrap(),
         member_token(&GroupMember {
-            email: "bob@gmail.com".into(),
+            account_id: "300db02d-b75a-4922-8759-f08a0efa5a40".into(),
             fingerprint: pin
         })
         .unwrap()
@@ -31,7 +51,7 @@ fn group_author_namespace_binds_email_even_if_two_accounts_share_a_key() {
 fn maximum_group_frame_preserves_fixed_padding_and_exact_ascii_bounds() {
     let members = (0..8)
         .map(|index| GroupMember {
-            email: format!("member{index}@gmail.com"),
+            account_id: format!("00000000-0000-4000-8000-{index:012x}"),
             fingerprint: format!("{index:064x}"),
         })
         .collect::<Vec<_>>();
@@ -84,7 +104,8 @@ fn bundle(state: &State) -> KeyBundle {
         .nth(state.identities.known.len())
         .cloned();
     KeyBundle {
-        email: state.email.clone(),
+        account_id: state.account_id.clone(),
+        username: state.username.clone(),
         registration_id: upload.registration_id,
         identity_key: upload.identity_key,
         signed_pre_key: upload.signed_pre_key,
@@ -95,9 +116,9 @@ fn bundle(state: &State) -> KeyBundle {
 async fn connect(a: &mut State, b: &mut State) {
     a.add_contact(bundle(b)).await.unwrap();
     b.add_contact(bundle(a)).await.unwrap();
-    a.verify_contact(&b.email, &fingerprint(&b.upload.identity_key).unwrap())
+    a.verify_contact(&b.account_id, &fingerprint(&b.upload.identity_key).unwrap())
         .unwrap();
-    b.verify_contact(&a.email, &fingerprint(&a.upload.identity_key).unwrap())
+    b.verify_contact(&a.account_id, &fingerprint(&a.upload.identity_key).unwrap())
         .unwrap();
 }
 fn queued(sender: &str, request: &SendRequest) -> QueuedMessage {
@@ -112,9 +133,15 @@ fn restart(state: State) -> State {
     serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap()
 }
 async fn trio() -> (State, State, State) {
-    let mut a = State::initialize("alice@gmail.com").await.unwrap();
-    let mut b = State::initialize("bob@gmail.com").await.unwrap();
-    let mut c = State::initialize("carol@gmail.com").await.unwrap();
+    let mut a = State::initialize("0beaac69-d53e-48d2-b5aa-dd405b7f414d", "u0beaac69")
+        .await
+        .unwrap();
+    let mut b = State::initialize("300db02d-b75a-4922-8759-f08a0efa5a40", "u300db02d")
+        .await
+        .unwrap();
+    let mut c = State::initialize("c36e0493-49f8-4439-aa4c-2aa333bf235f", "uc36e0493")
+        .await
+        .unwrap();
     connect(&mut a, &mut b).await;
     connect(&mut a, &mut c).await;
     connect(&mut b, &mut c).await;
@@ -126,7 +153,7 @@ fn pairwise_group_fanout_reply_reordering_restart_and_metadata() {
     futures::executor::block_on(async {
         let (mut a, mut b, mut c) = trio().await;
         let group = a
-            .create_group("ASCII group", &[b.email.clone(), c.email.clone()])
+            .create_group("ASCII group", &[b.account_id.clone(), c.account_id.clone()])
             .unwrap();
         let first = a
             .encrypt_group(&group.id, "first group text")
@@ -157,9 +184,9 @@ fn pairwise_group_fanout_reply_reordering_restart_and_metadata() {
             for batch in [&second, &first] {
                 let leg = batch
                     .iter()
-                    .find(|leg| leg.recipient == receiver.email)
+                    .find(|leg| leg.recipient == receiver.account_id)
                     .unwrap();
-                let message = receiver.decrypt(queued(&a.email, leg)).await.unwrap();
+                let message = receiver.decrypt(queued(&a.account_id, leg)).await.unwrap();
                 assert!(message.text.is_some() && message.security_alert.is_none());
                 assert_eq!(message.group_id.as_deref(), Some(group.id.as_str()));
                 assert_eq!(message.sender_fingerprint, row.sender_fingerprint);
@@ -169,7 +196,7 @@ fn pairwise_group_fanout_reply_reordering_restart_and_metadata() {
                 *receiver = restart(receiver.clone());
                 assert!(
                     receiver
-                        .decrypt(queued(&a.email, leg))
+                        .decrypt(queued(&a.account_id, leg))
                         .await
                         .unwrap()
                         .duplicate
@@ -183,11 +210,11 @@ fn pairwise_group_fanout_reply_reordering_restart_and_metadata() {
         for receiver in [&mut a, &mut c] {
             let leg = reply
                 .iter()
-                .find(|leg| leg.recipient == receiver.email)
+                .find(|leg| leg.recipient == receiver.account_id)
                 .unwrap();
             assert_eq!(
                 receiver
-                    .decrypt(queued(&b.email, leg))
+                    .decrypt(queued(&b.account_id, leg))
                     .await
                     .unwrap()
                     .text
@@ -208,17 +235,23 @@ fn pairwise_group_fanout_reply_reordering_restart_and_metadata() {
 fn unknown_members_quarantine_durably_then_resolve_without_ratchet_replay() {
     futures::executor::block_on(async {
         let (mut a, mut b, c) = trio().await;
-        b.verified.remove(&c.email);
+        b.verified.remove(&c.account_id);
         let group = a
-            .create_group("requires Carol", &[b.email.clone(), c.email.clone()])
+            .create_group(
+                "requires Carol",
+                &[b.account_id.clone(), c.account_id.clone()],
+            )
             .unwrap();
         let sent = a
             .encrypt_group(&group.id, "hidden until verified")
             .await
             .unwrap();
-        let leg = sent.iter().find(|leg| leg.recipient == b.email).unwrap();
+        let leg = sent
+            .iter()
+            .find(|leg| leg.recipient == b.account_id)
+            .unwrap();
         let before = serde_json::to_value(&b.sessions).unwrap();
-        let deferred = b.decrypt(queued(&a.email, leg)).await.unwrap();
+        let deferred = b.decrypt(queued(&a.account_id, leg)).await.unwrap();
         assert!(deferred.deferred && deferred.text.is_none() && deferred.security_alert.is_none());
         assert!(b.messages.is_empty() && b.groups.is_empty());
         assert_eq!(b.deferred_groups.len(), 1);
@@ -227,12 +260,17 @@ fn unknown_members_quarantine_durably_then_resolve_without_ratchet_replay() {
         let received_at = b.deferred_groups[0].received_at;
         let expiry = b.deferred_groups[0].expires_at;
         b = restart(b);
-        assert!(b.decrypt(queued(&a.email, leg)).await.unwrap().duplicate);
+        assert!(
+            b.decrypt(queued(&a.account_id, leg))
+                .await
+                .unwrap()
+                .duplicate
+        );
         let snapshot = b.snapshot().unwrap();
-        assert_eq!(snapshot["pending_group_senders"], json!([a.email]));
+        assert_eq!(snapshot["pending_group_senders"], json!([a.account_id]));
         assert_eq!(snapshot["next_expiry"], expiry);
         assert!(!snapshot.to_string().contains("hidden until verified"));
-        b.verify_contact(&c.email, &fingerprint(&c.upload.identity_key).unwrap())
+        b.verify_contact(&c.account_id, &fingerprint(&c.upload.identity_key).unwrap())
             .unwrap();
         assert_eq!(serde_json::to_value(&b.sessions).unwrap(), after);
         assert!(b.deferred_groups.is_empty());
@@ -251,17 +289,25 @@ fn unknown_members_quarantine_durably_then_resolve_without_ratchet_replay() {
 fn readonly_rust_views_never_promote_quarantine_without_a_persistable_transition() {
     futures::executor::block_on(async {
         let (mut a, mut b, c) = trio().await;
-        b.verified.remove(&c.email);
+        b.verified.remove(&c.account_id);
         let group = a
-            .create_group("read helper", &[b.email.clone(), c.email.clone()])
+            .create_group("read helper", &[b.account_id.clone(), c.account_id.clone()])
             .unwrap();
         let legs = a
             .encrypt_group(&group.id, "durable promotion only")
             .await
             .unwrap();
-        let leg = legs.iter().find(|leg| leg.recipient == b.email).unwrap();
-        assert!(b.decrypt(queued(&a.email, leg)).await.unwrap().deferred);
-        b.verified.insert(c.email.clone());
+        let leg = legs
+            .iter()
+            .find(|leg| leg.recipient == b.account_id)
+            .unwrap();
+        assert!(
+            b.decrypt(queued(&a.account_id, leg))
+                .await
+                .unwrap()
+                .deferred
+        );
+        b.verified.insert(c.account_id.clone());
         let before = serde_json::to_value(&b).unwrap();
         assert!(b.history().unwrap().is_empty());
         assert!(
@@ -290,75 +336,21 @@ fn readonly_rust_views_never_promote_quarantine_without_a_persistable_transition
 }
 
 #[test]
-fn version_two_upgrade_preserves_crypto_live_history_outbox_and_original_deadline() {
+fn old_and_future_group_state_versions_are_rejected_without_resetting_ratchets() {
     futures::executor::block_on(async {
-        let (mut a, mut b, _) = trio().await;
-        let current = current_time().unwrap() + 1;
-        let direct = a
-            .encrypt_at(&b.email, "retained v2 message", current)
-            .await
-            .unwrap();
-        let self_message = a
-            .encrypt_at("alice@gmail.com", "retained v2 self", current)
-            .await
-            .unwrap();
-        let mut legacy = serde_json::to_value(&a).unwrap();
-        legacy["version"] = json!(2);
-        for field in [
-            "groups",
-            "group_outbox",
-            "logical_received",
-            "deferred_groups",
-            "group_identity_warnings",
-        ] {
-            legacy.as_object_mut().unwrap().remove(field);
+        let (mut a, b, _) = trio().await;
+        a.encrypt(&b.account_id, "retained message").await.unwrap();
+        let saved = serde_json::to_value(&a).unwrap();
+        for version in [2, 6, 8] {
+            let mut incompatible = saved.clone();
+            incompatible["version"] = json!(version);
+            assert!(
+                dispatch(json!({"op":"expire","state":incompatible}))
+                    .await
+                    .is_err()
+            );
         }
-        let mut migrated: State = serde_json::from_value(legacy.clone()).unwrap();
-        assert!(migrated.expire_at(current).unwrap());
-        assert_eq!(migrated.version, 6);
-        let saved = serde_json::to_value(&migrated).unwrap();
-        for field in [
-            "email",
-            "identities",
-            "sessions",
-            "prekeys",
-            "signed",
-            "kyber",
-            "upload",
-            "verified",
-            "outbox",
-            "messages",
-            "received",
-            "self_channel",
-        ] {
-            assert_eq!(saved[field], legacy[field], "migration changed {field}");
-        }
-        assert!(migrated.groups.is_empty() && migrated.deferred_groups.is_empty());
-        assert!(!migrated.expire_at(current).unwrap());
-        assert_eq!(
-            b.decrypt_at(queued(&a.email, &direct), current)
-                .await
-                .unwrap()
-                .text
-                .as_deref(),
-            Some("retained v2 message")
-        );
-        assert_eq!(
-            migrated
-                .decrypt_at(queued(&a.email, &self_message), current)
-                .await
-                .unwrap()
-                .text
-                .as_deref(),
-            Some("retained v2 self")
-        );
-        let mut future = saved;
-        future["version"] = json!(7);
-        assert!(
-            dispatch(json!({"op":"expire","state":future}))
-                .await
-                .is_err()
-        );
+        assert_eq!(serde_json::to_value(&a).unwrap(), saved);
     });
 }
 
@@ -366,9 +358,12 @@ fn version_two_upgrade_preserves_crypto_live_history_outbox_and_original_deadlin
 fn quarantine_expiry_and_full_capacity_allow_relay_progress() {
     futures::executor::block_on(async {
         let (mut a, mut b, c) = trio().await;
-        b.verified.remove(&c.email);
+        b.verified.remove(&c.account_id);
         let group = a
-            .create_group("quarantine cap", &[b.email.clone(), c.email.clone()])
+            .create_group(
+                "quarantine cap",
+                &[b.account_id.clone(), c.account_id.clone()],
+            )
             .unwrap();
         let current = current_time().unwrap() + 1;
         let mut first_expiry = 0;
@@ -377,8 +372,14 @@ fn quarantine_expiry_and_full_capacity_allow_relay_progress() {
                 .encrypt_group_at(&group.id, "bounded pending body", current)
                 .await
                 .unwrap();
-            let leg = legs.iter().find(|leg| leg.recipient == b.email).unwrap();
-            let message = b.decrypt_at(queued(&a.email, leg), current).await.unwrap();
+            let leg = legs
+                .iter()
+                .find(|leg| leg.recipient == b.account_id)
+                .unwrap();
+            let message = b
+                .decrypt_at(queued(&a.account_id, leg), current)
+                .await
+                .unwrap();
             if index < 64 {
                 assert!(message.deferred && message.security_alert.is_none());
             } else {
@@ -394,11 +395,11 @@ fn quarantine_expiry_and_full_capacity_allow_relay_progress() {
         assert_eq!(b.deferred_groups.len(), 64);
         assert_eq!(b.messages.len(), 1); // Generic rejection only, no deferred text.
         let direct = a
-            .encrypt_at(&b.email, "direct still works", current)
+            .encrypt_at(&b.account_id, "direct still works", current)
             .await
             .unwrap();
         assert_eq!(
-            b.decrypt_at(queued(&a.email, &direct), current)
+            b.decrypt_at(queued(&a.account_id, &direct), current)
                 .await
                 .unwrap()
                 .text
@@ -413,22 +414,28 @@ fn quarantine_expiry_and_full_capacity_allow_relay_progress() {
                 .unwrap()
                 .contains("bounded pending body")
         );
-        b.verify_contact(&c.email, &fingerprint(&c.upload.identity_key).unwrap())
+        b.verify_contact(&c.account_id, &fingerprint(&c.upload.identity_key).unwrap())
             .unwrap();
         assert!(b.groups.is_empty() && b.messages.is_empty());
         // A first delivery after expiry never quarantines unknown members.
         a.expire_at(first_expiry).unwrap();
         let later_group = a
-            .create_group("new after retirement", &[b.email.clone(), c.email.clone()])
+            .create_group(
+                "new after retirement",
+                &[b.account_id.clone(), c.account_id.clone()],
+            )
             .unwrap();
         let legs = a
             .encrypt_group_at(&later_group.id, "late unknown", first_expiry)
             .await
             .unwrap();
-        let leg = legs.iter().find(|leg| leg.recipient == b.email).unwrap();
-        b.verified.remove(&c.email);
+        let leg = legs
+            .iter()
+            .find(|leg| leg.recipient == b.account_id)
+            .unwrap();
+        b.verified.remove(&c.account_id);
         let message = b
-            .decrypt_at(queued(&a.email, leg), leg.expires_at)
+            .decrypt_at(queued(&a.account_id, leg), leg.expires_at)
             .await
             .unwrap();
         assert!(message.expired && message.text.is_none() && !message.deferred);
@@ -441,12 +448,17 @@ fn fanout_preflight_and_late_signal_failure_are_atomic() {
     futures::executor::block_on(async {
         let (mut a, b, c) = trio().await;
         let group = a
-            .create_group("atomic fanout", &[b.email.clone(), c.email.clone()])
+            .create_group(
+                "atomic fanout",
+                &[b.account_id.clone(), c.account_id.clone()],
+            )
             .unwrap();
         let current = current_time().unwrap() + 1;
         a.expire_at(current).unwrap();
         for _ in 0..15 {
-            a.encrypt_at(&b.email, "pending", current).await.unwrap();
+            a.encrypt_at(&b.account_id, "pending", current)
+                .await
+                .unwrap();
         }
         let before = serde_json::to_value(&a).unwrap();
         assert!(
@@ -458,7 +470,7 @@ fn fanout_preflight_and_late_signal_failure_are_atomic() {
         a.outbox.clear();
         a.sessions
             .0
-            .insert(c.email.clone(), encode(b"invalid later peer session"));
+            .insert(c.account_id.clone(), encode(b"invalid later peer session"));
         let before = serde_json::to_value(&a).unwrap();
         assert!(
             a.encrypt_group_at(&group.id, "first leg must roll back", current)
@@ -466,7 +478,7 @@ fn fanout_preflight_and_late_signal_failure_are_atomic() {
                 .is_err()
         );
         assert_eq!(serde_json::to_value(&a).unwrap(), before);
-        a.verified.remove(&c.email);
+        a.verified.remove(&c.account_id);
         let before = serde_json::to_value(&a).unwrap();
         assert_eq!(
             a.encrypt_group_at(&group.id, "blocked", current)
@@ -484,10 +496,10 @@ fn changed_member_blocks_group_and_cancels_every_pending_fanout_leg() {
     futures::executor::block_on(async {
         let (mut a, b, c) = trio().await;
         let group = a
-            .create_group("old roster", &[b.email.clone(), c.email.clone()])
+            .create_group("old roster", &[b.account_id.clone(), c.account_id.clone()])
             .unwrap();
         let unrelated = a
-            .create_group("still current", std::slice::from_ref(&c.email))
+            .create_group("still current", std::slice::from_ref(&c.account_id))
             .unwrap();
         let affected = a
             .encrypt_group(&group.id, "retain cancelled history")
@@ -497,9 +509,9 @@ fn changed_member_blocks_group_and_cancels_every_pending_fanout_leg() {
             .encrypt_group(&unrelated.id, "unaffected group")
             .await
             .unwrap();
-        let direct = a.encrypt(&c.email, "unaffected direct").await.unwrap();
+        let direct = a.encrypt(&c.account_id, "unaffected direct").await.unwrap();
         a.sent(&affected[0].id).unwrap();
-        a.block_groups_for_contact(&b.email).unwrap();
+        a.block_groups_for_contact(&b.account_id).unwrap();
         assert!(a.groups[&group.id].blocked);
         assert!(!a.groups[&unrelated.id].blocked);
         assert!(
@@ -511,9 +523,9 @@ fn changed_member_blocks_group_and_cancels_every_pending_fanout_leg() {
         assert!(a.outbox.iter().any(|pending| pending.id == direct.id));
         assert_eq!(a.messages[0].status.as_deref(), Some("cancelled"));
         assert_eq!(a.messages[0].accepted_count, Some(1));
-        let fresh = State::initialize(&b.email).await.unwrap();
+        let fresh = State::initialize(&b.account_id, &b.username).await.unwrap();
         a.replace_contact(
-            &b.email,
+            &b.account_id,
             bundle(&fresh),
             &fingerprint(&b.upload.identity_key).unwrap(),
             &fingerprint(&fresh.upload.identity_key).unwrap(),
@@ -539,7 +551,7 @@ fn logical_dedupe_rejects_conflicting_reuse_and_ignores_padding_changes() {
     futures::executor::block_on(async {
         let (mut a, mut b, c) = trio().await;
         let group = a
-            .create_group("dedupe", &[b.email.clone(), c.email.clone()])
+            .create_group("dedupe", &[b.account_id.clone(), c.account_id.clone()])
             .unwrap();
         let now = current_time().unwrap();
         let logical = uuid::Uuid::new_v4();
@@ -553,10 +565,10 @@ fn logical_dedupe_rejects_conflicting_reuse_and_ignores_padding_changes() {
                 frame
             };
             let leg = a
-                .encrypt_frame(&b.email, &bytes, deadline(now).unwrap())
+                .encrypt_frame(&b.account_id, &bytes, deadline(now).unwrap())
                 .await
                 .unwrap();
-            let message = b.decrypt(queued(&a.email, &leg)).await.unwrap();
+            let message = b.decrypt(queued(&a.account_id, &leg)).await.unwrap();
             match round {
                 0 => assert_eq!(message.text.as_deref(), Some("original")),
                 1 => assert!(message.duplicate && message.text.is_none()),
@@ -578,7 +590,7 @@ fn authenticated_bad_group_frames_reject_without_trusting_roster() {
     futures::executor::block_on(async {
         let (mut a, mut b, c) = trio().await;
         let group = a
-            .create_group("tamper", &[b.email.clone(), c.email.clone()])
+            .create_group("tamper", &[b.account_id.clone(), c.account_id.clone()])
             .unwrap();
         let now = current_time().unwrap();
         let good = group_frame(
@@ -611,9 +623,9 @@ fn authenticated_bad_group_frames_reject_without_trusting_roster() {
         nil_uuid[12..28].fill(0);
         cases.push(nil_uuid);
         // A fully consistent descriptor still must include recipient and sender.
-        for removed in [&a.email, &b.email] {
+        for removed in [&a.account_id, &b.account_id] {
             let mut fake = group.clone();
-            fake.members.retain(|member| &member.email != removed);
+            fake.members.retain(|member| &member.account_id != removed);
             fake.id = hex(&group_id(
                 &fake.nonce,
                 &fake.title,
@@ -631,10 +643,10 @@ fn authenticated_bad_group_frames_reject_without_trusting_roster() {
         }
         for bytes in cases {
             let leg = a
-                .encrypt_frame(&b.email, &bytes, deadline(now).unwrap())
+                .encrypt_frame(&b.account_id, &bytes, deadline(now).unwrap())
                 .await
                 .unwrap();
-            let rejected = b.decrypt(queued(&a.email, &leg)).await.unwrap();
+            let rejected = b.decrypt(queued(&a.account_id, &leg)).await.unwrap();
             assert!(rejected.text.is_none() && rejected.security_alert.is_some());
             assert!(
                 rejected.sent_at.is_none()
@@ -643,9 +655,9 @@ fn authenticated_bad_group_frames_reject_without_trusting_roster() {
             );
             assert!(b.groups.is_empty() && b.deferred_groups.is_empty());
         }
-        let direct = a.encrypt(&b.email, "after bad group").await.unwrap();
+        let direct = a.encrypt(&b.account_id, "after bad group").await.unwrap();
         assert_eq!(
-            b.decrypt(queued(&a.email, &direct))
+            b.decrypt(queued(&a.account_id, &direct))
                 .await
                 .unwrap()
                 .text
@@ -663,15 +675,15 @@ fn empty_group_retirement_frees_capacity_but_cannot_revive_blocked_current_roste
         a.expire_at(current).unwrap();
         b.expire_at(current).unwrap();
         let incoming_group = a
-            .create_group("incoming", &[b.email.clone(), c.email.clone()])
+            .create_group("incoming", &[b.account_id.clone(), c.account_id.clone()])
             .unwrap();
         for _ in 0..32 {
-            b.create_group("bounded", std::slice::from_ref(&a.email))
+            b.create_group("bounded", std::slice::from_ref(&a.account_id))
                 .unwrap();
         }
         let before = serde_json::to_value(&b).unwrap();
         assert!(
-            b.create_group("over capacity", std::slice::from_ref(&a.email))
+            b.create_group("over capacity", std::slice::from_ref(&a.account_id))
                 .is_err()
         );
         assert_eq!(serde_json::to_value(&b).unwrap(), before);
@@ -679,20 +691,26 @@ fn empty_group_retirement_frees_capacity_but_cannot_revive_blocked_current_roste
             .encrypt_group_at(&incoming_group.id, "capacity reject", current)
             .await
             .unwrap();
-        let leg = legs.iter().find(|leg| leg.recipient == b.email).unwrap();
-        let rejected = b.decrypt_at(queued(&a.email, leg), current).await.unwrap();
+        let leg = legs
+            .iter()
+            .find(|leg| leg.recipient == b.account_id)
+            .unwrap();
+        let rejected = b
+            .decrypt_at(queued(&a.account_id, leg), current)
+            .await
+            .unwrap();
         assert!(rejected.security_alert.is_some() && !rejected.deferred);
         b.expire_at(current + MESSAGE_LIFETIME_SECONDS).unwrap();
         assert!(b.groups.is_empty());
         let group = b
-            .create_group("blocked", std::slice::from_ref(&a.email))
+            .create_group("blocked", std::slice::from_ref(&a.account_id))
             .unwrap();
-        b.block_groups_for_contact(&a.email).unwrap();
+        b.block_groups_for_contact(&a.account_id).unwrap();
         b.expire_at(current + MESSAGE_LIFETIME_SECONDS * 2).unwrap();
         assert!(b.groups.contains_key(&group.id));
-        let fresh = State::initialize(&a.email).await.unwrap();
+        let fresh = State::initialize(&a.account_id, &a.username).await.unwrap();
         b.replace_contact(
-            &a.email,
+            &a.account_id,
             bundle(&fresh),
             &fingerprint(&a.upload.identity_key).unwrap(),
             &fingerprint(&fresh.upload.identity_key).unwrap(),
@@ -708,21 +726,32 @@ fn empty_group_retirement_frees_capacity_but_cannot_revive_blocked_current_roste
 fn warning_before_discovery_or_promotion_cannot_be_cleared_by_old_pin_verification() {
     futures::executor::block_on(async {
         let (mut a, mut b, c) = trio().await;
-        b.verified.remove(&c.email);
+        b.verified.remove(&c.account_id);
         let group = a
-            .create_group("not discovered yet", &[b.email.clone(), c.email.clone()])
+            .create_group(
+                "not discovered yet",
+                &[b.account_id.clone(), c.account_id.clone()],
+            )
             .unwrap();
         let sent = a
             .encrypt_group(&group.id, "must stay hidden")
             .await
             .unwrap();
-        let leg = sent.iter().find(|leg| leg.recipient == b.email).unwrap();
-        assert!(b.decrypt(queued(&a.email, leg)).await.unwrap().deferred);
+        let leg = sent
+            .iter()
+            .find(|leg| leg.recipient == b.account_id)
+            .unwrap();
+        assert!(
+            b.decrypt(queued(&a.account_id, leg))
+                .await
+                .unwrap()
+                .deferred
+        );
         // Simulate a durable pre-upgrade verified pin with an external warning.
         // The warning operation must run before automatic expiry/resolution.
-        b.verified.insert(c.email.clone());
+        b.verified.insert(c.account_id.clone());
         let old_pin = fingerprint(&c.upload.identity_key).unwrap();
-        let blocked = dispatch(json!({"op":"block_groups_for_contact","state":b,"email":c.email,"fingerprint":old_pin})).await.unwrap();
+        let blocked = dispatch(json!({"op":"block_groups_for_contact","state":b,"account_id":c.account_id,"fingerprint":old_pin})).await.unwrap();
         assert!(
             blocked["resolved_message_ids"]
                 .as_array()
@@ -731,45 +760,62 @@ fn warning_before_discovery_or_promotion_cannot_be_cleared_by_old_pin_verificati
         );
         b = serde_json::from_value(blocked["state"].clone()).unwrap();
         assert!(b.groups.is_empty() && b.messages.is_empty());
-        b.verify_contact(&c.email, &old_pin).unwrap();
+        b.verify_contact(&c.account_id, &old_pin).unwrap();
         assert_eq!(b.deferred_groups.len(), 1);
         assert!(b.messages.is_empty());
         let fresh_group = a
-            .create_group("new warned descriptor", &[b.email.clone(), c.email.clone()])
+            .create_group(
+                "new warned descriptor",
+                &[b.account_id.clone(), c.account_id.clone()],
+            )
             .unwrap();
         let sent = a
             .encrypt_group(&fresh_group.id, "also hidden")
             .await
             .unwrap();
-        let leg = sent.iter().find(|leg| leg.recipient == b.email).unwrap();
-        assert!(b.decrypt(queued(&a.email, leg)).await.unwrap().deferred);
+        let leg = sent
+            .iter()
+            .find(|leg| leg.recipient == b.account_id)
+            .unwrap();
+        assert!(
+            b.decrypt(queued(&a.account_id, leg))
+                .await
+                .unwrap()
+                .deferred
+        );
         b = restart(b);
         b.expire().unwrap();
         assert!(b.groups.is_empty() && b.messages.is_empty());
-        let fresh = State::initialize(&c.email).await.unwrap();
+        let fresh = State::initialize(&c.account_id, &c.username).await.unwrap();
         let new_pin = fingerprint(&fresh.upload.identity_key).unwrap();
-        b.replace_contact(&c.email, bundle(&fresh), &old_pin, &new_pin)
+        b.replace_contact(&c.account_id, bundle(&fresh), &old_pin, &new_pin)
             .await
             .unwrap();
-        assert!(!b.group_identity_warnings.contains_key(&c.email));
+        assert!(!b.group_identity_warnings.contains_key(&c.account_id));
         // A stale sidecar recovered after a successful pin replacement is a no-op.
-        let recovered = dispatch(json!({"op":"block_groups_for_contact","state":b,"email":c.email,"fingerprint":old_pin})).await.unwrap();
+        let recovered = dispatch(json!({"op":"block_groups_for_contact","state":b,"account_id":c.account_id,"fingerprint":old_pin})).await.unwrap();
         b = serde_json::from_value(recovered["state"].clone()).unwrap();
-        assert!(!b.group_identity_warnings.contains_key(&c.email));
+        assert!(!b.group_identity_warnings.contains_key(&c.account_id));
         assert!(b.messages.is_empty());
-        a.replace_contact(&c.email, bundle(&fresh), &old_pin, &new_pin)
+        a.replace_contact(&c.account_id, bundle(&fresh), &old_pin, &new_pin)
             .await
             .unwrap();
         let current_group = a
-            .create_group("verified new roster", &[b.email.clone(), c.email.clone()])
+            .create_group(
+                "verified new roster",
+                &[b.account_id.clone(), c.account_id.clone()],
+            )
             .unwrap();
         let sent = a
             .encrypt_group(&current_group.id, "new pin allowed")
             .await
             .unwrap();
-        let leg = sent.iter().find(|leg| leg.recipient == b.email).unwrap();
+        let leg = sent
+            .iter()
+            .find(|leg| leg.recipient == b.account_id)
+            .unwrap();
         assert_eq!(
-            b.decrypt(queued(&a.email, leg))
+            b.decrypt(queued(&a.account_id, leg))
                 .await
                 .unwrap()
                 .text
@@ -783,12 +829,12 @@ fn warning_before_discovery_or_promotion_cannot_be_cleared_by_old_pin_verificati
 fn direct_metadata_is_historical_and_legacy_or_invalid_metadata_remains_absent() {
     futures::executor::block_on(async {
         let (mut a, mut b, _) = trio().await;
-        let message = a.encrypt(&b.email, "metadata").await.unwrap();
+        let message = a.encrypt(&b.account_id, "metadata").await.unwrap();
         assert_eq!(a.messages[0].status.as_deref(), Some("queued"));
         a.sent(&message.id).unwrap();
         assert_eq!(a.messages[0].status.as_deref(), Some("relay_accepted"));
         assert_eq!(a.messages[0].accepted_count, Some(1));
-        let received = b.decrypt(queued(&a.email, &message)).await.unwrap();
+        let received = b.decrypt(queued(&a.account_id, &message)).await.unwrap();
         assert_eq!(
             received.sent_at,
             Some(message.expires_at - MESSAGE_LIFETIME_SECONDS)
@@ -822,7 +868,7 @@ fn direct_metadata_is_historical_and_legacy_or_invalid_metadata_remains_absent()
         );
         let invalid = QueuedMessage {
             id: uuid::Uuid::new_v4().to_string(),
-            sender: a.email.clone(),
+            sender: a.account_id.clone(),
             envelope: "invalid".into(),
             created_at: i64::MAX,
         };

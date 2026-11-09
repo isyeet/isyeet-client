@@ -1,6 +1,6 @@
 import Foundation
 
-// Reject redirects so neither a bearer token nor a Google authorization code can
+// Reject redirects so neither a bearer token nor an authentication proof can
 // be forwarded to an endpoint other than the one the app selected.
 final class NoRedirect: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask,
@@ -39,7 +39,8 @@ enum Network {
 
 struct LoginResponse: Decodable {
     let token: String
-    let email: String
+    let account_id: String
+    let username: String
     let expires_at: Int64
 }
 
@@ -47,50 +48,117 @@ struct API {
     static let inboxPageSize = 50
     let base: URL
 
-    func login(idToken: String) async throws -> LoginResponse {
-        let response = try await request("v1/auth/google", method: "POST", body: .object(["id_token": .string(idToken)]))
-        return try validateLogin(response)
+    func deviceAuthority(token: String) async throws -> DeviceAuthorityResponse {
+        guard DeviceAuthorizationFeature.enabled, base.absoluteString == "https://api-staging.isyeet.io" else { throw SafetyError.deviceAuthorizationUnavailable }
+        let data = try await request("v3/devices/authority", method: "GET", token: token)
+        return try JSONDecoder().decode(DeviceAuthorityResponse.self, from: data).validated()
     }
 
-    #if DEBUG && targetEnvironment(simulator)
-    func simulatorDevelopmentLogin(email: String) async throws -> LoginResponse {
-        guard base.scheme == "http", ["127.0.0.1", "localhost", "[::1]", "::1"].contains(base.host ?? "") else {
-            throw SafetyError.insecureServer
-        }
-        let response = try await request("v1/auth/dev", method: "POST", body: .object(["email": .string(email)]))
-        return try validateLogin(response)
+    func changeDeviceAuthority(_ change: JSONValue, token: String, actionToken: String) async throws -> DeviceAuthorityReceipt {
+        guard DeviceAuthorizationFeature.enabled, base.absoluteString == "https://api-staging.isyeet.io" else { throw SafetyError.deviceAuthorizationUnavailable }
+        let data = try await request("v3/devices/authority", method: "PUT", token: token,
+                                    body: .object(["action_token": .string(actionToken), "change": change]))
+        return try JSONDecoder().decode(DeviceAuthorityReceipt.self, from: data).validated()
     }
-    #endif
+
+    func registrationStart(username: String) async throws -> PasskeyChallenge {
+        try await challenge("v2/auth/register/start", body: .object(["username": .string(username)]))
+    }
+    func loginStart() async throws -> PasskeyChallenge {
+        try await challenge("v2/auth/login/start", body: .object([:]))
+    }
+    func loginFinish(challengeID: String, credential: JSONValue, registering: Bool) async throws -> LoginResponse {
+        let data = try await request("v2/auth/" + (registering ? "register" : "login") + "/finish", method: "POST",
+            body: .object(["challenge_id": .string(challengeID), "credential": credential]))
+        return try validateLogin(data)
+    }
+    func reauthenticationStart(token: String, purpose: String) async throws -> PasskeyChallenge {
+        try await challenge("v2/auth/reauth/start", token: token, body: .object(["purpose": .string(purpose)]))
+    }
+    func reauthenticationFinish(token: String, challengeID: String, credential: JSONValue) async throws -> PasskeyAction {
+        let data = try await request("v2/auth/reauth/finish", method: "POST", token: token,
+            body: .object(["challenge_id": .string(challengeID), "credential": credential]))
+        let action = try JSONDecoder().decode(PasskeyAction.self, from: data)
+        guard !action.action_token.isEmpty, action.action_token.utf8.count <= 1024,
+              action.action_token.utf8.allSatisfy({ (0x21...0x7e).contains($0) }),
+              action.expires_at > Int64(Date().timeIntervalSince1970) else { throw SafetyError.invalidResponse }
+        return action
+    }
+    func passkeys(token: String) async throws -> [RegisteredPasskey] {
+        let data = try await request("v2/passkeys", method: "GET", token: token)
+        let result = try JSONDecoder().decode(PasskeyList.self, from: data)
+        guard result.maximum == 8, (1...8).contains(result.passkeys.count),
+              Set(result.passkeys.map(\.id)).count == result.passkeys.count,
+              result.passkeys.allSatisfy({ Data(base64URL: $0.id) != nil && (1...32).contains($0.label.utf8.count)
+                  && $0.label.utf8.allSatisfy({ (0x20...0x7e).contains($0) }) && $0.created_at > 0 }) else { throw SafetyError.invalidResponse }
+        return result.passkeys
+    }
+    func addPasskeyStart(token: String, actionToken: String, label: String) async throws -> PasskeyChallenge {
+        try await challenge("v2/passkeys/add/start", token: token,
+                            body: .object(["action_token": .string(actionToken), "label": .string(label)]))
+    }
+    func addPasskeyFinish(token: String, challengeID: String, credential: JSONValue) async throws {
+        _ = try await request("v2/passkeys/add/finish", method: "POST", token: token,
+            body: .object(["challenge_id": .string(challengeID), "credential": credential]))
+    }
+    func removePasskey(id: String, token: String, actionToken: String) async throws {
+        guard Data(base64URL: id) != nil else { throw SafetyError.invalidResponse }
+        _ = try await request("v2/passkeys/" + id, method: "DELETE", token: token, body: .object(["action_token": .string(actionToken)]))
+    }
+    private func challenge(_ path: String, token: String? = nil, body: JSONValue) async throws -> PasskeyChallenge {
+        let data = try await request(path, method: "POST", token: token, body: body)
+        let challenge = try JSONDecoder().decode(PasskeyChallenge.self, from: data)
+        guard AccountStateResponse.canonicalGeneration(challenge.challenge_id) else { throw SafetyError.invalidResponse }
+        return challenge
+    }
+    func lookup(username: String, token: String) async throws -> DirectoryAccount {
+        let data = try await request("v2/directory/lookup", method: "POST", token: token, body: .object(["username": .string(username)]))
+        let account = try JSONDecoder().decode(DirectoryAccount.self, from: data).validated()
+        guard account.username == username else { throw SafetyError.invalidResponse }
+        return account
+    }
 
     private func validateLogin(_ response: Data) throws -> LoginResponse {
         let login = try JSONDecoder().decode(LoginResponse.self, from: response)
-        guard try MessageSafety.canonicalEmail(login.email) == login.email,
+        guard try MessageSafety.canonicalAccountID(login.account_id) == login.account_id,
+              try MessageSafety.canonicalUsername(login.username) == login.username,
               !login.token.isEmpty, login.token.utf8.count <= 1024,
               login.token.utf8.allSatisfy({ (0x21...0x7e).contains($0) }),
               login.expires_at > Int64(Date().timeIntervalSince1970) else { throw SafetyError.invalidResponse }
         return login
     }
 
-    func claim(email: String, token: String) async throws -> JSONValue {
-        let response = try await request("v1/keys/claim", method: "POST", token: token, body: .object(["email": .string(email)]))
+    func claim(account_id: String, token: String) async throws -> JSONValue {
+        let response = try await request("v2/keys/claim", method: "POST", token: token, body: .object(["account_id": .string(account_id)]))
         let bundle = try JSONDecoder().decode(JSONValue.self, from: response)
-        guard case .object(let fields) = bundle, fields["email"] == .string(email) else { throw SafetyError.invalidResponse }
+        guard case .object(let fields) = bundle, fields["account_id"] == .string(account_id) else { throw SafetyError.invalidResponse }
         return bundle
     }
 
-    func accountState(idToken: String, email: String) async throws -> AccountStateResponse? {
-        let (data, response) = try await response("v1/account/state", method: "POST", body: .object(["id_token": .string(idToken)]))
+    func accountState(token: String, account_id: String) async throws -> AccountStateResponse? {
+        let (data, response) = try await response("v2/account/state", method: "GET", token: token)
         if response.statusCode == 404 {
             guard (try? JSONDecoder().decode([String: String].self, from: data)) == ["error": "not found"] else { throw SafetyError.invalidResponse }
             return nil
         }
         if response.statusCode == 401 { throw SafetyError.unauthorized }
         guard response.statusCode == 200 else { throw SafetyError.network }
-        return try JSONDecoder().decode(AccountStateResponse.self, from: data).validated(email: email)
+        return try JSONDecoder().decode(AccountStateResponse.self, from: data).validated(account_id: account_id)
     }
 
-    func performAccountOperation(_ operation: AccountOperation, idToken: String) async throws {
-        let (data, response) = try await response("v1/account/" + operation.kind.rawValue, method: "POST", body: operation.request(idToken: idToken))
+    func accountState(actionToken: String, account_id: String) async throws -> AccountStateResponse? {
+        let (data, response) = try await response("v2/account/state", method: "POST", body: .object(["action_token": .string(actionToken)]))
+        if response.statusCode == 404 {
+            guard (try? JSONDecoder().decode([String: String].self, from: data)) == ["error": "not found"] else { throw SafetyError.invalidResponse }
+            return nil
+        }
+        if response.statusCode == 401 { throw SafetyError.unauthorized }
+        guard response.statusCode == 200 else { throw SafetyError.network }
+        return try JSONDecoder().decode(AccountStateResponse.self, from: data).validated(account_id: account_id)
+    }
+
+    func performAccountOperation(_ operation: AccountOperation) async throws {
+        let (data, response) = try await response("v2/account/" + operation.kind.rawValue, method: "POST", body: operation.request())
         if response.statusCode == 404 {
             guard (try? JSONDecoder().decode([String: String].self, from: data)) == ["error": "not found"] else { throw SafetyError.invalidResponse }
             throw SafetyError.accountOperationConflict
@@ -102,17 +170,17 @@ struct API {
     }
 
     func keyMaintenanceInventory(token: String) async throws -> JSONValue {
-        let data = try await request("v1/keys/maintenance", method: "GET", token: token)
+        let data = try await request("v2/keys/maintenance", method: "GET", token: token)
         return try JSONDecoder().decode(JSONValue.self, from: data)
     }
 
     func maintainKeys(_ pending: JSONValue, token: String) async throws -> JSONValue {
-        let data = try await request("v1/keys/maintenance", method: "PUT", token: token, body: pending)
+        let data = try await request("v2/keys/maintenance", method: "PUT", token: token, body: pending)
         return try JSONDecoder().decode(JSONValue.self, from: data)
     }
 
     func ownKeys(token: String) async throws -> JSONValue? {
-        let (data, response) = try await response("v1/keys/me", method: "GET", token: token)
+        let (data, response) = try await response("v2/keys/me", method: "GET", token: token)
         if response.statusCode == 404 {
             guard (try? JSONDecoder().decode([String: String].self, from: data)) == ["error": "not found"] else { throw SafetyError.invalidResponse }
             return nil
@@ -123,25 +191,25 @@ struct API {
     }
 
     func requireUnregisteredIdentity(token: String) async throws {
-        let (data, response) = try await response("v1/keys/me", method: "GET", token: token)
+        let (data, response) = try await response("v2/keys/me", method: "GET", token: token)
         try AccountRegistration.requireUnregistered(statusCode: response.statusCode, body: data)
     }
 
     func upload(keys: JSONValue, token: String) async throws {
-        _ = try await request("v1/keys", method: "PUT", token: token, body: keys)
+        _ = try await request("v2/keys", method: "PUT", token: token, body: keys)
     }
 
-    func syncContacts(emails: [String], token: String) async throws {
-        _ = try await request("v1/contacts", method: "PUT", token: token,
-                              body: .object(["emails": .array(emails.map(JSONValue.string))]))
+    func syncContacts(account_ids: [String], token: String) async throws {
+        _ = try await request("v2/contacts", method: "PUT", token: token,
+                              body: .object(["account_ids": .array(account_ids.map(JSONValue.string))]))
     }
 
     func send(_ envelope: SendRequest, token: String) async throws {
-        _ = try await request("v1/messages", method: "POST", token: token, encodedBody: MessageTransport.paddedBody(envelope))
+        _ = try await request("v2/messages", method: "POST", token: token, encodedBody: MessageTransport.paddedBody(envelope))
     }
 
     func trafficMode(token: String, allowLegacy: Bool) async throws -> TrafficModeResponse? {
-        let (data, response) = try await response("v1/traffic-mode", method: "GET", token: token)
+        let (data, response) = try await response("v2/traffic-mode", method: "GET", token: token)
         if response.statusCode == 401 { throw SafetyError.unauthorized }
         if response.statusCode == 404 && allowLegacy { return nil }
         guard response.statusCode == 200 else { throw SafetyError.trafficUnavailable }
@@ -149,7 +217,7 @@ struct API {
     }
 
     func setTrafficMode(cover: Bool, token: String) async throws -> TrafficModeResponse {
-        let data = try await request("v1/traffic-mode", method: "PUT", token: token, body: .object(["cover": .bool(cover)]))
+        let data = try await request("v2/traffic-mode", method: "PUT", token: token, body: .object(["cover": .bool(cover)]))
         let mode = try JSONDecoder().decode(TrafficModeResponse.self, from: data).validated()
         guard mode.cover == cover else { throw SafetyError.invalidResponse }
         return mode
@@ -157,28 +225,30 @@ struct API {
 
     func inbox(token: String) async throws -> [QueuedMessage] {
         struct Response: Decodable { let messages: [QueuedMessage] }
-        let data = try await request("v1/messages?limit=\(Self.inboxPageSize)", method: "GET", token: token)
+        let data = try await request("v2/messages?limit=\(Self.inboxPageSize)", method: "GET", token: token)
         let messages = try JSONDecoder().decode(Response.self, from: data).messages
         guard messages.count <= Self.inboxPageSize else { throw SafetyError.invalidResponse }
         return messages
     }
 
     func acknowledge(_ id: String, token: String) async throws {
-        _ = try await request("v1/messages/ack", method: "POST", token: token, body: .object(["ids": .array([.string(id)])]))
+        _ = try await request("v2/messages/ack", method: "POST", token: token, body: .object(["ids": .array([.string(id)])]))
     }
 
     func updatePushToken(_ deviceToken: String?, token: String) async throws {
         if let deviceToken {
-            _ = try await request("v1/push-token", method: "PUT", token: token,
+            _ = try await request("v2/push-token", method: "PUT", token: token,
                                   body: .object(["token": .string(deviceToken)]))
         } else {
-            _ = try await request("v1/push-token", method: "DELETE", token: token)
+            _ = try await request("v2/push-token", method: "DELETE", token: token)
         }
     }
 
     private func request(_ path: String, method: String, token: String? = nil, body: JSONValue? = nil, encodedBody: Data? = nil) async throws -> Data {
         let (data, response) = try await response(path, method: method, token: token, body: body, encodedBody: encodedBody)
         if response.statusCode == 401 { throw SafetyError.unauthorized }
+        if response.statusCode == 409, path == "v3/devices/authority" { throw SafetyError.deviceAuthorizationConflict }
+        if response.statusCode == 409, (path == "v2/auth/register/start" || path == "v2/auth/register/finish") { throw SafetyError.usernameUnavailable }
         guard (200...299).contains(response.statusCode) else { throw SafetyError.network }
         return data
     }
